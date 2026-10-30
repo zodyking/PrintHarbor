@@ -15,3 +15,14 @@ services:
       ADMIN_USER: ${ADMIN_USER:-admin}
     ports:
       - "47831"
+    volumes:
+      - printharbor-data:/data
+      - printharbor-cups:/etc/cups
+      - printharbor-spool:/var/spool/cups
+      - printharbor-tailscale:/var/lib/tailscale
+
+volumes:
+  printharbor-data:
+  printharbor-cups:
+  printharbor-spool:
+  printharbor-tailscale:

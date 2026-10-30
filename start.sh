@@ -1,7 +1,10 @@
 #!/bin/sh
 set -eu
-mkdir -p /data/files /data/tmp /run/cups /var/lib/tailscale /var/run/tailscale
+mkdir -p /data/files /data/tmp /run/cups /var/lib/tailscale /var/run/tailscale /etc/cups /var/spool/cups/tmp
 chmod 700 /data/files /data/tmp
+if [ ! -s /etc/cups/cupsd.conf ] && [ -f /usr/share/printharbor/cups-seed/cupsd.conf ]; then
+  cp -a /usr/share/printharbor/cups-seed/. /etc/cups/
+fi
 PIDS=""
 shutdown() {
   for pid in $PIDS; do

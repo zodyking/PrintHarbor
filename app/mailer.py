@@ -3,6 +3,7 @@ import email
 import imaplib
 import re
 import secrets
+import select
 import smtplib
 import threading
 import time
@@ -27,18 +28,24 @@ def snapshot():
 def summarize_poll(count, problems):
     if problems:
         total = count or problems
-        return 'Attention', f'{problems} of {total} messages were rejected or failed'
-    return 'Healthy', f'Checked inbox; processed {count} messages'
+        return 'Attention', f'{problems} of {total} new messages were rejected or failed'
+    if count:
+        return 'Healthy', f'Printed {count} new message(s) from the folder'
+    return 'Watching', 'Watching the folder for new mail'
 
 def parse_command(subject, token):
-    """Require mailbox subject PIN to mitigate spoofed From addresses.
-    Examples: PRINT PIN:ABC123 DUPLEX COPIES=2; PRINT PIN:ABC123 SHORT EDGE
+    """Read duplex and copies from the subject. A PIN is required only when one is set.
+    Examples: PRINT DUPLEX COPIES=2; PRINT PIN:ABC123 SHORT EDGE
     """
     value = subject or ''
-    match = re.search(r'\bPIN:([A-Za-z0-9]{6,32})\b', value, re.I)
-    if not match or not secrets.compare_digest(match.group(1).lower(), (token or '').lower()):
-        return None
-    normalized = re.sub(r'\bPIN:[A-Za-z0-9]+\b', '', value, flags=re.I).upper()
+    token = (token or '').strip()
+    if token:
+        match = re.search(r'\bPIN:([A-Za-z0-9]{6,32})\b', value, re.I)
+        if not match or not secrets.compare_digest(match.group(1).lower(), token.lower()):
+            return None
+        normalized = re.sub(r'\bPIN:[A-Za-z0-9]+\b', '', value, flags=re.I).upper()
+    else:
+        normalized = value.upper()
     if 'SHORT EDGE' in normalized:
         sides = 'two-sided-short-edge'
     elif 'DUPLEX' in normalized or '2-SIDED' in normalized:
@@ -65,9 +72,12 @@ def allowed_message(msg, config):
     if recipient and recipient not in _addresses(','.join(str(v) for v in (msg.get('To'), msg.get('Cc')) if v)):
         return False, 'Recipient does not match mailbox address', None, sender
     subject = str(msg.get('Subject', ''))
-    command = parse_command(subject, config.get('email_pin', ''))
+    pin = (config.get('email_pin') or '').strip()
+    command = parse_command(subject, pin)
     if not command:
-        return False, 'Missing or incorrect PIN in email subject', None, sender
+        if pin:
+            return False, 'Missing or incorrect PIN in email subject', None, sender
+        return False, 'Copies must be from 1 to 10', None, sender
     upper = subject.upper()
     if 'DUPLEX' not in upper and '2-SIDED' not in upper and 'SHORT EDGE' not in upper:
         fallback = config.get('default_sides') or 'one-sided'
@@ -239,45 +249,158 @@ def list_folders(host, port, user, password):
         except Exception:
             pass
 
-def check_once():
-    conn = None
+def uids_after(payload, last_uid):
+    raw = payload or b''
+    if isinstance(raw, str):
+        raw = raw.encode()
+    found = []
+    last = int(last_uid)
+    for piece in raw.split():
+        try:
+            number = int(piece)
+        except ValueError:
+            continue
+        if number > last:
+            found.append(piece)
+    return found
+
+def parse_status(payload):
+    text = payload.decode('utf-8', 'replace') if isinstance(payload, bytes) else str(payload)
+    validity = re.search(r'UIDVALIDITY\s+(\d+)', text)
+    nxt = re.search(r'UIDNEXT\s+(\d+)', text)
+    if not validity or not nxt:
+        raise RuntimeError('Mailbox did not report a position')
+    return int(validity.group(1)), int(nxt.group(1))
+
+def cursor_key(config):
+    host = (config.get('imap_host') or '').strip()
+    user = (config.get('imap_user') or '').strip()
+    folder = (config.get('imap_folder') or 'INBOX').strip() or 'INBOX'
+    return host + '\n' + user + '\n' + folder
+
+def mailbox_identity(config):
+    return (
+        (config.get('imap_host') or '').strip(),
+        str(config.get('imap_port') or '993'),
+        (config.get('imap_user') or '').strip(),
+        (config.get('imap_folder') or 'INBOX').strip() or 'INBOX',
+        config.get('imap_password') or '',
+    )
+
+def fallback_wait(config):
     try:
-        config = store.settings()
-        if config.get('mail_enabled') != '1':
-            publish(state='Disabled', detail='Turn on automatic email printing below, then save.')
-            return
-        if not all([
-            config.get('imap_host'), config.get('imap_user'), config.get('imap_password'),
-            config.get('default_queue'),
-        ]):
-            publish(state='Needs setup', detail='Mailbox login and a default printer are required')
-            return
-        folder = config.get('imap_folder') or 'INBOX'
-        conn = imaplib.IMAP4_SSL(config['imap_host'], int(config.get('imap_port', '993')), timeout=18)
-        conn.login(config['imap_user'], config['imap_password'])
-        status, _ = conn.select(folder)
-        if status != 'OK':
-            raise RuntimeError('Cannot select IMAP folder')
-        # UIDVALIDITY prevents accidentally treating a reused UID as the same message.
-        uidstatus, data = conn.status(folder, '(UIDVALIDITY)')
-        uidvalidity = (data[0] or b'').decode(errors='ignore') if uidstatus == 'OK' else 'unknown'
-        status, ids = conn.uid('search', None, 'UNSEEN')
-        if status != 'OK':
-            raise RuntimeError('Unable to search inbox')
-        count = problems = 0
-        for uid in (ids[0] or b'').split()[:35]:
-            status, response = conn.uid('fetch', uid, '(RFC822)')
-            if status != 'OK' or not response:
-                store.event('warning', 'Could not read an unread email')
-                problems += 1
+        value = int(config.get('poll_seconds', '3'))
+    except (TypeError, ValueError):
+        value = 3
+    return max(2, min(value, 5))
+
+def ready(config):
+    if config.get('mail_enabled') != '1':
+        publish(state='Disabled', detail='Turn on automatic email printing below, then save.')
+        return False
+    if not all([
+        config.get('imap_host'), config.get('imap_user'), config.get('imap_password'),
+        config.get('default_queue'),
+    ]):
+        publish(state='Needs setup', detail='Mailbox login and a default printer are required')
+        return False
+    return True
+
+def adopt_cursor(config, uidvalidity, uidnext):
+    key = cursor_key(config)
+    validity = str(uidvalidity)
+    last_raw = str(config.get('mail_last_uid') or '')
+    if config.get('mail_watch') == key and config.get('mail_uidvalidity') == validity and last_raw.isdigit():
+        return int(last_raw), False
+    last = max(int(uidnext) - 1, 0)
+    store.set_setting('mail_watch', key)
+    store.set_setting('mail_uidvalidity', validity)
+    store.set_setting('mail_last_uid', str(last))
+    return last, True
+
+def supports_idle(conn):
+    typ, data = conn.capability()
+    if typ != 'OK':
+        return False
+    blob = b' '.join(item if isinstance(item, bytes) else str(item).encode() for item in (data or []))
+    return b'IDLE' in blob.upper()
+
+def wait_for_new_mail(conn, seconds=30):
+    tag = conn._new_tag()
+    if isinstance(tag, str):
+        tag = tag.encode()
+    conn.send(tag + b' IDLE\r\n')
+    reply = conn.readline()
+    if not reply.startswith(b'+'):
+        raise RuntimeError('Mailbox cannot watch for new mail')
+    changed = False
+    try:
+        deadline = time.monotonic() + seconds
+        while not STOP.is_set() and time.monotonic() < deadline:
+            remaining = max(0, deadline - time.monotonic())
+            try:
+                readable, _, _ = select.select([conn.sock], [], [], min(1, remaining))
+            except (OSError, ValueError) as exc:
+                raise RuntimeError('Mailbox watch stopped') from exc
+            if not readable:
                 continue
+            line = conn.readline()
+            if not line:
+                raise RuntimeError('Mailbox connection closed')
+            upper = line.upper()
+            if b'EXISTS' in upper or b'RECENT' in upper:
+                changed = True
+                break
+            if b'BYE' in upper:
+                raise RuntimeError('Mailbox connection closed')
+    finally:
+        try:
+            conn.sock.settimeout(3)
+        except Exception:
+            pass
+        try:
+            conn.send(b'DONE\r\n')
+            while True:
+                line = conn.readline()
+                if not line or line.startswith(tag):
+                    break
+        except Exception:
+            pass
+        try:
+            conn.sock.settimeout(None)
+        except Exception:
+            pass
+    return changed
+
+def take_new(conn, config, folder):
+    status, data = conn.status(folder, '(UIDVALIDITY UIDNEXT)')
+    if status != 'OK' or not data or not data[0]:
+        raise RuntimeError('Cannot read mailbox position')
+    validity, uidnext = parse_status(data[0])
+    last, primed = adopt_cursor(config, validity, uidnext)
+    if primed:
+        publish(state='Watching', detail=f'Watching {folder} for new mail. Mail already there is left alone.')
+        return False
+    status, ids = conn.uid('search', None, 'UID', f'{last + 1}:*')
+    if status != 'OK':
+        raise RuntimeError('Unable to search the folder')
+    pending = uids_after(ids[0] if ids else b'', last)[:35]
+    if not pending:
+        publish(state='Watching', detail=f'Watching {folder} for new mail.')
+        return False
+    count = problems = 0
+    for uid in pending:
+        uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
+        status, response = conn.uid('fetch', uid, '(BODY.PEEK[])')
+        payload = None
+        if status == 'OK' and response:
             payload = next((item[1] for item in response if isinstance(item, tuple) and isinstance(item[1], bytes)), None)
-            if not payload:
-                store.event('warning', 'Could not read an unread email')
-                problems += 1
-                continue
+        if not payload:
+            store.event('warning', 'Could not read a new email')
+            problems += 1
+        else:
             msg = email.message_from_bytes(payload, policy=policy.default)
-            key = f'{config["imap_user"]}:{uidvalidity}:{uid.decode()}'
+            key = f'{config["imap_user"]}:{validity}:{uid_text}'
             result = handle_message(msg, key, config)
             if (not result['accepted']) or result['errors']:
                 problems += 1
@@ -286,18 +409,40 @@ def check_once():
             except Exception as exc:
                 secret = config.get('imap_password') or ''
                 store.event('error', 'Result email failed: ' + str(exc).replace(secret, '')[:300])
-            # Mark handled mail as seen, including rejects. Print errors stay in Jobs for retry.
-            conn.uid('store', uid, '+FLAGS', '(\\Seen)')
-            count += 1
-        state, detail = summarize_poll(count, problems)
-        publish(state=state, detail=detail)
-    except Exception as exc:
-        secret = ''
         try:
-            secret = store.settings().get('imap_password') or ''
+            conn.uid('store', uid, '+FLAGS', '(\\Seen)')
         except Exception:
-            secret = ''
-        detail = str(exc).replace(secret, '') if secret else str(exc)
+            store.event('warning', 'Could not mark a handled email as seen')
+        store.set_setting('mail_last_uid', uid_text)
+        count += 1
+    state, detail = summarize_poll(count, problems)
+    publish(state=state, detail=detail)
+    return len(pending) >= 35
+
+def _scrub(exc):
+    secret = ''
+    try:
+        secret = store.settings().get('imap_password') or ''
+    except Exception:
+        secret = ''
+    detail = str(exc).replace(secret, '') if secret else str(exc)
+    return detail
+
+def check_once():
+    conn = None
+    try:
+        config = store.settings()
+        if not ready(config):
+            return
+        folder = config.get('imap_folder') or 'INBOX'
+        conn = imaplib.IMAP4_SSL(config['imap_host'], int(config.get('imap_port', '993')), timeout=18)
+        conn.login(config['imap_user'], config['imap_password'])
+        status, _ = conn.select(folder)
+        if status != 'OK':
+            raise RuntimeError('Cannot select IMAP folder')
+        take_new(conn, config, folder)
+    except Exception as exc:
+        detail = _scrub(exc)
         publish(state='Error', detail=detail[:170])
         store.event('error', 'Mail check failed: ' + detail[:300])
     finally:
@@ -310,9 +455,39 @@ def check_once():
 
 def run_loop():
     while not STOP.is_set():
-        check_once()
+        conn = None
         try:
-            delay = max(20, min(int(store.settings().get('poll_seconds', '60')), 3600))
-        except (TypeError, ValueError):
-            delay = 60
-        STOP.wait(delay)
+            config = store.settings()
+            if not ready(config):
+                STOP.wait(2)
+                continue
+            folder = (config.get('imap_folder') or 'INBOX').strip() or 'INBOX'
+            identity = mailbox_identity(config)
+            conn = imaplib.IMAP4_SSL(config['imap_host'], int(config.get('imap_port', '993')), timeout=18)
+            conn.login(config['imap_user'], config['imap_password'])
+            status, _ = conn.select(folder)
+            if status != 'OK':
+                raise RuntimeError('Cannot select IMAP folder')
+            idle = supports_idle(conn)
+            while not STOP.is_set():
+                fresh = store.settings()
+                if not ready(fresh) or mailbox_identity(fresh) != identity:
+                    break
+                if take_new(conn, fresh, folder):
+                    continue
+                if idle:
+                    wait_for_new_mail(conn)
+                elif STOP.wait(fallback_wait(fresh)):
+                    break
+        except Exception as exc:
+            detail = _scrub(exc)
+            publish(state='Error', detail=detail[:170])
+            store.event('error', 'Mail check failed: ' + detail[:300])
+            STOP.wait(3)
+        finally:
+            publish(checked=time.strftime('%Y-%m-%d %H:%M:%S'))
+            if conn:
+                try:
+                    conn.logout()
+                except Exception:
+                    pass

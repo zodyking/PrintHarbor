@@ -34,7 +34,7 @@ services:
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
       ADMIN_USER: ${ADMIN_USER:-admin}
       ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
-      POLL_SECONDS: ${POLL_SECONDS:-60}
+      POLL_SECONDS: ${POLL_SECONDS:-3}
       SNMP_COMMUNITY: ${SNMP_COMMUNITY:-public}
     volumes:
       - tailscale-socket:/var/run/tailscale:ro

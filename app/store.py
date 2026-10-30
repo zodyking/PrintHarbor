@@ -1,7 +1,6 @@
 import base64
 import hashlib
 import os
-import secrets
 import sqlite3
 from contextlib import contextmanager
 from pathlib import Path
@@ -15,7 +14,7 @@ PRIVATE_KEYS = {'imap_password', 'email_pin'}
 DEFAULTS = {
     'mail_enabled': '0', 'imap_host': 'imap.gmail.com', 'imap_port': '993',
     'imap_user': '', 'imap_folder': 'INBOX', 'allowed_senders': '',
-    'mail_recipient': '', 'poll_seconds': os.getenv('POLL_SECONDS', '60'),
+    'mail_recipient': '', 'poll_seconds': os.getenv('POLL_SECONDS', '3'),
     'default_queue': '', 'default_sides': 'one-sided', 'max_pages': '40',
     'max_files': '5', 'max_mb': '12', 'print_email_body': '0',
     'reply_enabled': '0', 'smtp_from': '', 'smtp_host': 'smtp.gmail.com', 'smtp_port': '587',
@@ -86,7 +85,7 @@ def initialize():
         for k, v in DEFAULTS.items():
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (k, v))
         if not db.execute("SELECT 1 FROM settings WHERE key='email_pin'").fetchone():
-            set_setting('email_pin', secrets.token_hex(4), db=db)
+            set_setting('email_pin', '', db=db)
         db.execute(
             "UPDATE jobs SET status='error', error=? WHERE status='preparing'",
             ('Interrupted before the document was submitted',),

@@ -195,7 +195,7 @@ def mail_values(
     sender = smtp_from.strip()
     host = imap_host.strip()
     smtp = smtp_host.strip() or 'smtp.gmail.com'
-    if not (1 <= imap_port <= 65535 and 1 <= smtp_port <= 65535 and 20 <= poll_seconds <= 3600 and 1 <= max_pages <= 200 and 1 <= max_mb <= 30 and 1 <= max_files <= 10):
+    if not (1 <= imap_port <= 65535 and 1 <= smtp_port <= 65535 and 2 <= poll_seconds <= 3600 and 1 <= max_pages <= 200 and 1 <= max_mb <= 30 and 1 <= max_files <= 10):
         raise printing.PrintError('Invalid configuration limits')
     if default_sides.strip() not in printing.SIDES:
         raise printing.PrintError('Invalid duplex option')
@@ -249,7 +249,7 @@ def save_settings(
     except printing.PrintError as exc:
         return nextpage('email', error=str(exc))
     if pin and not re.fullmatch(r'[A-Za-z0-9]{6,32}', pin):
-        return nextpage('email', error='PIN must be 6 to 32 letters or digits')
+        return nextpage('email', error='PIN must be 6 to 32 letters or digits, or blank to require none')
     if values['default_queue']:
         with store.connection() as db:
             if not db.execute('SELECT 1 FROM printers WHERE queue=?', (values['default_queue'],)).fetchone():
@@ -259,8 +259,7 @@ def save_settings(
             store.set_setting(key, value, db=db)
         if password:
             store.set_setting('imap_password', password, db=db)
-        if pin:
-            store.set_setting('email_pin', pin, db=db)
+        store.set_setting('email_pin', pin, db=db)
     store.event('info', 'Email printing settings updated')
     return nextpage('email', 'Settings saved')
 
