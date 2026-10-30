@@ -13,15 +13,15 @@
 <a class="skip" href="#content">Skip to content</a>
 <div class="layout">
 <aside class="sidebar">
-  <a href="/" class="brand"><span class="brand-logo" aria-hidden="true">P<span>H</span></span><span><strong>PrintHarbor</strong><small>Print operations</small></span></a>
+  <a href="/" class="brand"><span class="brand-logo" aria-hidden="true">PH</span><span><strong>PrintHarbor</strong><small>Print operations</small></span></a>
   <div class="sidebar-label">Workspace</div>
   <nav aria-label="Primary">
     <ul class="navlist">
-      <li><a class="navlink {% if page=='overview' %}active{% endif %}" {% if page=='overview' %}aria-current="page"{% endif %} href="/?page=overview"><span class="nav-icon" aria-hidden="true">◫</span> Overview</a></li>
-      <li><a class="navlink {% if page=='printers' %}active{% endif %}" {% if page=='printers' %}aria-current="page"{% endif %} href="/?page=printers"><span class="nav-icon" aria-hidden="true">▣</span> Printers</a></li>
-      <li><a class="navlink {% if page=='jobs' %}active{% endif %}" {% if page=='jobs' %}aria-current="page"{% endif %} href="/?page=jobs"><span class="nav-icon" aria-hidden="true">≡</span> Print jobs</a></li>
-      <li><a class="navlink {% if page=='email' %}active{% endif %}" {% if page=='email' %}aria-current="page"{% endif %} href="/?page=email"><span class="nav-icon" aria-hidden="true">✉</span> Email automation</a></li>
-      <li><a class="navlink {% if page=='tailscale' %}active{% endif %}" {% if page=='tailscale' %}aria-current="page"{% endif %} href="/?page=tailscale"><span class="nav-icon" aria-hidden="true">◎</span> Tailscale</a></li>
+      <li><a class="navlink {% if page=='overview' %}active{% endif %}" {% if page=='overview' %}aria-current="page"{% endif %} href="/?page=overview"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><rect x="3" y="3" width="7" height="7" rx="1.5"/><rect x="14" y="3" width="7" height="7" rx="1.5"/><rect x="3" y="14" width="7" height="7" rx="1.5"/><rect x="14" y="14" width="7" height="7" rx="1.5"/></svg> Overview</a></li>
+      <li><a class="navlink {% if page=='printers' %}active{% endif %}" {% if page=='printers' %}aria-current="page"{% endif %} href="/?page=printers"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 14h12v7H6z"/></svg> Printers</a></li>
+      <li><a class="navlink {% if page=='jobs' %}active{% endif %}" {% if page=='jobs' %}aria-current="page"{% endif %} href="/?page=jobs"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" aria-hidden="true"><path d="M8 6h13M8 12h13M8 18h13M3 6h.01M3 12h.01M3 18h.01"/></svg> Print jobs</a></li>
+      <li><a class="navlink {% if page=='email' %}active{% endif %}" {% if page=='email' %}aria-current="page"{% endif %} href="/?page=email"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linejoin="round" aria-hidden="true"><path d="M4 6h16v12H4z"/><path d="m4 7 8 6 8-6"/></svg> Email automation</a></li>
+      <li><a class="navlink {% if page=='tailscale' %}active{% endif %}" {% if page=='tailscale' %}aria-current="page"{% endif %} href="/?page=tailscale"><svg class="nav-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" aria-hidden="true"><circle cx="6" cy="12" r="2.2"/><circle cx="18" cy="7" r="2.2"/><circle cx="18" cy="17" r="2.2"/><path d="M8.2 11.2 15.6 8.2M8.2 12.8l7.4 3"/></svg> Tailscale</a></li>
     </ul>
   </nav>
   <div class="sidebar-bottom">
@@ -35,7 +35,7 @@
     {% if notice %}<div class="alert good" role="status">{{ notice }}</div>{% endif %}
     {% if error %}<div class="alert bad" role="alert">{{ error }}</div>{% endif %}
     {% if page=='overview' %}
-      <div class="headerline"><div><div class="eyebrow">Overview</div><h1>Overview</h1><p class="muted">Printers, jobs, and intake status.</p></div><a class="button subtle" href="/?page=email">Email automation <span aria-hidden="true">→</span></a></div>
+      <div class="headerline"><div><h1>Overview</h1><p class="muted">Printers, jobs, and intake status.</p></div><a class="button subtle" href="/?page=email">Email automation <span aria-hidden="true">→</span></a></div>
       <div class="metrics">
         <div class="metric"><span>Registered printers</span><strong>{{ counts.printers }}</strong><small>Configured CUPS destinations</small></div>
         <div class="metric"><span>Submitted jobs</span><strong>{{ counts.submitted }}</strong><small>Status submitted in the latest 100</small></div>
@@ -65,7 +65,7 @@
           {% if printers %}
           <div class="printer-list">
             {% for p in printers %}
-            <div class="printer-line"><div class="printer-glyph" aria-hidden="true">▣</div><div><strong>{{ p.label }}</strong><small>{{ p.identity or p.host }} · {{ p.queue }}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span></div>
+            <div class="printer-line"><div class="printer-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 14h12v7H6z"/></svg></div><div><strong>{{ p.label }}</strong><small>{{ p.identity or p.host }} · {{ p.queue }}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span></div>
             {% endfor %}
           </div>
           {% else %}
@@ -87,14 +87,14 @@
         {% endif %}
       </section>
     {% elif page=='printers' %}
-      <div class="headerline"><div><div class="eyebrow">Queues</div><h1>Printers</h1><p class="muted">Add a printer by its address. PrintHarbor reads it and selects a driver.</p></div></div>
+      <div class="headerline"><div><h1>Printers</h1><p class="muted">Add a printer by its address. PrintHarbor reads it and selects a driver.</p></div></div>
       <div class="two-col">
         <section class="panel" aria-labelledby="destinations-title">
           <div class="panelhead"><div><h2 id="destinations-title">Connected destinations</h2><p>{{ printers|length }} registered print {{ 'queue' if printers|length==1 else 'queues' }}.</p></div></div>
           {% if printers %}
           <div class="printer-list">
             {% for p in printers %}
-            <div class="printer-line expand"><div class="printer-glyph" aria-hidden="true">▣</div><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}{% if p.pages_total %} · {{ p.pages_total }} pages{% endif %}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
+            <div class="printer-line expand"><div class="printer-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 14h12v7H6z"/></svg></div><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}{% if p.pages_total %} · {{ p.pages_total }} pages{% endif %}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
             {% endfor %}
           </div>
           {% else %}
@@ -111,9 +111,11 @@
             <p class="form-help">Queue name: {{ editing.queue }}</p>
             <label>Printer IPv4<input name="host" required value="{{ editing.host }}" inputmode="decimal" autocomplete="off" spellcheck="false" aria-describedby="printer-help"></label>
             <p id="printer-help" class="form-help">Saving a new address reads the printer again. Use “Read printer again” to refresh the driver without renaming it.</p>
-            <button class="button" type="submit" name="action" value="save">Save printer</button>
-            <button class="button subtle" type="submit" name="action" value="reread">Read printer again</button>
-            <a class="text-button" href="/?page=printers">Cancel</a>
+            <div class="actions">
+              <button class="button" type="submit" name="action" value="save">Save printer</button>
+              <button class="button subtle" type="submit" name="action" value="reread">Read printer again</button>
+              <a class="text-button" href="/?page=printers">Cancel</a>
+            </div>
           </form>
           {% else %}
           <div class="panelhead"><div><h2 id="add-printer-title">Add a printer</h2><p>Use the printer address reachable from this host.</p></div></div>
@@ -147,7 +149,7 @@
         </div>
       </section>
     {% elif page=='tailscale' %}
-      <div class="headerline"><div><div class="eyebrow">Remote path</div><h1>Tailscale</h1><p class="muted">Join this container to your tailnet so it can reach a printer on another network.</p></div></div>
+      <div class="headerline"><div><h1>Tailscale</h1><p class="muted">Join this container to your tailnet so it can reach a printer on another network.</p></div></div>
       {% if tail.online %}
       <section class="panel" aria-labelledby="tail-status-title">
         <div class="panelhead"><div><h2 id="tail-status-title">Connected</h2><p>{{ tail.hostname or 'This node' }} is on the tailnet.</p></div><span class="status online">Running</span></div>
@@ -173,8 +175,16 @@
         <p class="form-help">A normal Dokploy application cannot open <code>/dev/net/tun</code>. Create a Compose application instead, with compose file <code>docker-compose.yml</code>, the same <code>SESSION_SECRET</code> and <code>ADMIN_PASSWORD</code>, and the domain pointed at port 47831. After that deploy, this page accepts an auth key.</p>
       </section>
       {% endif %}
+      <section class="panel" aria-labelledby="tail-notes-title">
+        <div class="panelhead"><div><h2 id="tail-notes-title">Before you print</h2><p>The tailnet only helps when the printer's own address is approved.</p></div></div>
+        <div class="check-grid">
+          <div><b>01</b><strong>Advertise the printer</strong><p>An always-on device on the printer LAN should advertise that address, preferably as a /32.</p></div>
+          <div><b>02</b><strong>Approve the route</strong><p>Approve it in the Tailscale admin console and allow this node in the tailnet policy.</p></div>
+          <div><b>03</b><strong>Use the LAN address</strong><p>Add the printer with that LAN address, not a public address.</p></div>
+        </div>
+      </section>
     {% elif page=='jobs' %}
-      <div class="headerline"><div><div class="eyebrow">History</div><h1>Print jobs</h1><p class="muted">Every received print is listed. Submitted means CUPS accepted the job, not that a page printed.</p></div></div>
+      <div class="headerline"><div><h1>Print jobs</h1><p class="muted">Every received print is listed. Submitted means CUPS accepted the job, not that a page printed.</p></div></div>
       <section class="panel" aria-labelledby="job-log-title">
         <div class="panelhead"><div><h2 id="job-log-title">Job log</h2><p>Rejected mail stays in this log with the reason. Failed jobs can be retried when the converted file is still stored.</p></div><span class="chip">{{ jobs|length }} recent jobs</span></div>
         {% if jobs %}
@@ -214,52 +224,65 @@
       </section>
     {% elif page=='email' %}
       <div class="headerline">
-        <div><div class="eyebrow">Intake</div><h1>Email automation</h1><p class="muted">New mail in the selected folder prints to the default queue.</p></div>
+        <div><h1>Email automation</h1><p class="muted">New mail in the selected folder prints to the default queue.</p></div>
         <div class="mail-health is-{{ tone }}"><span class="green-dot {% if tone=='bad' %}is-bad{% elif tone!='good' %}is-warn{% endif %}"></span><div><strong>{{ mail.state }}</strong><small>{{ mail.detail or mail.checked or 'Not checked yet' }}</small></div></div>
       </div>
-      <section class="panel" aria-labelledby="mailbox-title">
-        <div class="panelhead"><div><h2 id="mailbox-title">Mailbox and automation</h2><p>Saved settings apply on the next check. Only new mail in the selected folder is read.</p></div><span class="chip">IMAP over TLS</span></div>
-        <form method="post" action="/settings/save" class="form-stack">
-          <input type="hidden" name="token" value="{{ token }}">
-          <label class="toggle"><input type="checkbox" name="mail_enabled" value="1" {% if config.mail_enabled=='1' %}checked{% endif %}><span><strong>Enable automatic email printing</strong><small>Watch the selected folder and print new mail as it arrives. Mail already in the folder is left alone. Save after turning this on.</small></span></label>
-          <div class="section-title">Mail connection</div>
-          <div class="form-row">
-            <label>IMAP server<input name="imap_host" required value="{{ config.imap_host }}" placeholder="imap.gmail.com" autocapitalize="off" spellcheck="false"></label>
-            <label>Port<input type="number" name="imap_port" min="1" max="65535" value="{{ config.imap_port }}" inputmode="numeric"></label>
+      <form method="post" action="/settings/save" class="stack">
+        <input type="hidden" name="token" value="{{ token }}">
+        <section class="panel" aria-labelledby="mailbox-title">
+          <div class="panelhead"><div><h2 id="mailbox-title">Mail connection</h2><p>Saved settings apply on the next check. Only new mail in the selected folder is read.</p></div><span class="chip">IMAP over TLS</span></div>
+          <div class="form-stack">
+            <label class="toggle"><input type="checkbox" name="mail_enabled" value="1" {% if config.mail_enabled=='1' %}checked{% endif %}><span><strong>Enable automatic email printing</strong><small>Watch the selected folder and print new mail as it arrives. Mail already in the folder is left alone. Save after turning this on.</small></span></label>
+            <div class="form-row">
+              <label>IMAP server<input name="imap_host" required value="{{ config.imap_host }}" placeholder="imap.gmail.com" autocapitalize="off" spellcheck="false"></label>
+              <label>Port<input type="number" name="imap_port" min="1" max="65535" value="{{ config.imap_port }}" inputmode="numeric"></label>
+            </div>
+            <div class="form-row">
+              <label>Mailbox email<input type="email" name="imap_user" value="{{ config.imap_user }}" placeholder="printer@gmail.com" autocomplete="off"></label>
+              <label>App password<input type="password" name="imap_password" autocomplete="new-password" placeholder="{% if config.imap_password %}Saved. Leave blank to keep{% else %}Enter app password{% endif %}"><small>Spaces are removed so a Gmail app password can be pasted as shown. Leave blank to keep the saved password.</small></label>
+            </div>
+            <label>Mailbox folder<select name="imap_folder" required>{% for folder in folders %}<option value="{{ folder }}" {% if config.imap_folder==folder %}selected{% endif %}>{{ folder }}</option>{% endfor %}</select><small>Load the mailbox folders, then choose one. The saved folder stays listed before you load.</small></label>
+            <div><button class="button subtle" type="submit" formaction="/mail/folders">Load folders</button></div>
           </div>
-          <div class="form-row">
-            <label>Mailbox email<input type="email" name="imap_user" value="{{ config.imap_user }}" placeholder="printer@gmail.com" autocomplete="off"></label>
-            <label>App password<input type="password" name="imap_password" autocomplete="new-password" placeholder="{% if config.imap_password %}Saved. Leave blank to keep{% else %}Enter app password{% endif %}"><small>Spaces are removed so a Gmail app password can be pasted as shown. Leave blank to keep the saved password.</small></label>
+        </section>
+        <section class="panel" aria-labelledby="security-controls-title">
+          <div class="panelhead"><div><h2 id="security-controls-title">Security controls</h2><p>Leave a field blank to turn that check off.</p></div></div>
+          <div class="form-stack">
+            <label>Approved sender emails<input name="allowed_senders" value="{{ config.allowed_senders }}" placeholder="Leave blank to accept any sender" autocapitalize="off" spellcheck="false"><small>Leave blank to accept mail from any sender. When filled, only these exact addresses can submit jobs. Separate them with commas.</small></label>
+            <label>Required destination email<input name="mail_recipient" type="email" value="{{ config.mail_recipient }}" placeholder="Leave blank to ignore destination"><small>Leave blank to accept any To or Cc. When filled, To or Cc must include this address.</small></label>
+            <label>Email subject PIN<input name="new_pin" maxlength="32" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" placeholder="Leave blank to require no PIN"><small>{% if config.email_pin %}A PIN is on. Leave this box blank and save to turn it off. Type the PIN shown in the examples to keep it, or type a new one to replace it.{% else %}No PIN is required. Enter 6 to 32 letters or digits to require one, or leave blank.{% endif %}</small></label>
           </div>
-          <label>Mailbox folder<select name="imap_folder" required>{% for folder in folders %}<option value="{{ folder }}" {% if config.imap_folder==folder %}selected{% endif %}>{{ folder }}</option>{% endfor %}</select><small>Load the mailbox folders, then choose one. The saved folder stays listed before you load.</small></label>
-          <button class="button subtle" type="submit" formaction="/mail/folders">Load folders</button>
-          <div class="section-title">Security controls</div>
-          <label>Approved sender emails<input name="allowed_senders" value="{{ config.allowed_senders }}" placeholder="Leave blank to accept any sender" autocapitalize="off" spellcheck="false"><small>Leave blank to accept mail from any sender. When filled, only these exact addresses can submit jobs. Separate them with commas.</small></label>
-          <label>Required destination email<input name="mail_recipient" type="email" value="{{ config.mail_recipient }}" placeholder="Leave blank to ignore destination"><small>Leave blank to accept any To or Cc. When filled, To or Cc must include this address.</small></label>
-          <label>Email subject PIN<input name="new_pin" maxlength="32" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" placeholder="Leave blank to require no PIN"><small>{% if config.email_pin %}A PIN is on. Leave this box blank and save to turn it off. Type the PIN shown in the examples to keep it, or type a new one to replace it.{% else %}No PIN is required. Enter 6 to 32 letters or digits to require one, or leave blank.{% endif %}</small></label>
-          <div class="section-title">Print behavior</div>
-          {% if not printers %}<p class="form-help">Add a printer before email intake can submit jobs.</p>{% endif %}
-          <div class="form-row">
-            <label>Default printer<select name="default_queue"><option value="">Select printer</option>{% for p in printers %}<option value="{{ p.queue }}" {% if config.default_queue==p.queue %}selected{% endif %}>{{ p.label }}</option>{% endfor %}</select></label>
-            <label>Default sides<select name="default_sides"><option value="one-sided" {% if config.default_sides=='one-sided' %}selected{% endif %}>Single-sided</option><option value="two-sided-long-edge" {% if config.default_sides=='two-sided-long-edge' %}selected{% endif %}>Long-edge duplex</option><option value="two-sided-short-edge" {% if config.default_sides=='two-sided-short-edge' %}selected{% endif %}>Short-edge duplex</option></select><small>Used when the subject does not say DUPLEX, 2-SIDED, or SHORT EDGE.</small></label>
+        </section>
+        <section class="panel" aria-labelledby="print-behavior-title">
+          <div class="panelhead"><div><h2 id="print-behavior-title">Print behavior</h2><p>Used when a message does not name its own layout.</p></div></div>
+          <div class="form-stack">
+            {% if not printers %}<p class="form-help">Add a printer before email intake can submit jobs.</p>{% endif %}
+            <div class="form-row">
+              <label>Default printer<select name="default_queue"><option value="">Select printer</option>{% for p in printers %}<option value="{{ p.queue }}" {% if config.default_queue==p.queue %}selected{% endif %}>{{ p.label }}</option>{% endfor %}</select></label>
+              <label>Default sides<select name="default_sides"><option value="one-sided" {% if config.default_sides=='one-sided' %}selected{% endif %}>Single-sided</option><option value="two-sided-long-edge" {% if config.default_sides=='two-sided-long-edge' %}selected{% endif %}>Long-edge duplex</option><option value="two-sided-short-edge" {% if config.default_sides=='two-sided-short-edge' %}selected{% endif %}>Short-edge duplex</option></select><small>Used when the subject does not say DUPLEX, 2-SIDED, or SHORT EDGE.</small></label>
+            </div>
+            <div class="form-row">
+              <label>Maximum pages per file<input type="number" name="max_pages" min="1" max="200" value="{{ config.max_pages }}" inputmode="numeric"></label>
+              <label>Maximum file size (MB)<input type="number" name="max_mb" min="1" max="30" value="{{ config.max_mb }}" inputmode="numeric"></label>
+              <label>Attachments per message<input type="number" name="max_files" min="1" max="10" value="{{ config.max_files }}" inputmode="numeric"></label>
+              <label>Backup check (seconds)<input type="number" name="poll_seconds" min="2" max="3600" value="{{ config.poll_seconds }}" inputmode="numeric"><small>New mail is picked up as it arrives. This backup check is used only when the mailbox cannot push, and it never waits more than 5 seconds.</small></label>
+            </div>
+            <label class="toggle"><input type="checkbox" name="print_email_body" value="1" {% if config.print_email_body=='1' %}checked{% endif %}><span><strong>Print plain-text body as fallback</strong><small>Only when the message has no supported attachment.</small></span></label>
           </div>
-          <div class="form-row">
-            <label>Maximum pages per file<input type="number" name="max_pages" min="1" max="200" value="{{ config.max_pages }}" inputmode="numeric"></label>
-            <label>Maximum file size (MB)<input type="number" name="max_mb" min="1" max="30" value="{{ config.max_mb }}" inputmode="numeric"></label>
-            <label>Attachments per message<input type="number" name="max_files" min="1" max="10" value="{{ config.max_files }}" inputmode="numeric"></label>
-            <label>Backup check (seconds)<input type="number" name="poll_seconds" min="2" max="3600" value="{{ config.poll_seconds }}" inputmode="numeric"><small>New mail is picked up as it arrives. This backup check is used only when the mailbox cannot push, and it never waits more than 5 seconds.</small></label>
+        </section>
+        <section class="panel" aria-labelledby="result-mail-title">
+          <div class="panelhead"><div><h2 id="result-mail-title">Result email</h2><p>One reply when a message is accepted or rejected.</p></div></div>
+          <div class="form-stack">
+            <label class="toggle"><input type="checkbox" name="reply_enabled" value="1" {% if config.reply_enabled=='1' %}checked{% endif %}><span><strong>Email the sender the result</strong><small>One reply when the message is accepted or rejected, including the reason.</small></span></label>
+            <label>From address<input type="email" name="smtp_from" value="{{ config.smtp_from }}" placeholder="printme@example.com" autocomplete="off"><small>Gmail logs in with the mailbox address above. This From address can be a Send mail as alias. Leave blank to send from the mailbox address.</small></label>
+            <div class="form-row">
+              <label>SMTP server<input name="smtp_host" value="{{ config.smtp_host or 'smtp.gmail.com' }}" placeholder="smtp.gmail.com" autocapitalize="off" spellcheck="false"></label>
+              <label>SMTP port<input type="number" name="smtp_port" min="1" max="65535" value="{{ config.smtp_port or '587' }}" inputmode="numeric"><small>Port 465 uses implicit TLS. Other ports use STARTTLS.</small></label>
+            </div>
+            <div><button class="button" type="submit">Save automation settings <span aria-hidden="true">→</span></button></div>
           </div>
-          <label class="toggle"><input type="checkbox" name="print_email_body" value="1" {% if config.print_email_body=='1' %}checked{% endif %}><span><strong>Print plain-text body as fallback</strong><small>Only when the message has no supported attachment.</small></span></label>
-          <div class="section-title">Result email</div>
-          <label class="toggle"><input type="checkbox" name="reply_enabled" value="1" {% if config.reply_enabled=='1' %}checked{% endif %}><span><strong>Email the sender the result</strong><small>One reply when the message is accepted or rejected, including the reason.</small></span></label>
-          <label>From address<input type="email" name="smtp_from" value="{{ config.smtp_from }}" placeholder="printme@example.com" autocomplete="off"><small>Gmail logs in with the mailbox address above. This From address can be a Send mail as alias. Leave blank to send from the mailbox address.</small></label>
-          <div class="form-row">
-            <label>SMTP server<input name="smtp_host" value="{{ config.smtp_host or 'smtp.gmail.com' }}" placeholder="smtp.gmail.com" autocapitalize="off" spellcheck="false"></label>
-            <label>SMTP port<input type="number" name="smtp_port" min="1" max="65535" value="{{ config.smtp_port or '587' }}" inputmode="numeric"><small>Port 465 uses implicit TLS. Other ports use STARTTLS.</small></label>
-          </div>
-          <button class="button" type="submit">Save automation settings <span aria-hidden="true">→</span></button>
-        </form>
-      </section>
+        </section>
+      </form>
       <div class="two-col">
         <section class="panel" aria-labelledby="examples-title">
           <h2 id="examples-title">Subject examples</h2>
