@@ -78,6 +78,64 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(out2['jobs'],1)
             self.assertEqual(fake.call_count,1)  # duplicate never re-submitted
 
+    def test_each_attachment_is_its_own_duplex_job(self):
+        from reportlab.pdfgen import canvas
+        from pypdf import PdfReader
+        import io
+        with store.connection() as db:
+            db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol) VALUES('Office','Office','192.168.1.20','ipp')")
+
+        def one_page(text):
+            buf=io.BytesIO()
+            doc=canvas.Canvas(buf)
+            doc.drawString(50,700,text)
+            doc.showPage()
+            doc.save()
+            return buf.getvalue()
+
+        two=io.BytesIO()
+        even=canvas.Canvas(two)
+        even.drawString(50,700,'page one')
+        even.showPage()
+        even.drawString(50,700,'page two')
+        even.showPage()
+        even.save()
+        even_path, even_pages=printing.prepare_bytes('even.pdf', two.getvalue(), 5)
+        self.assertEqual(even_pages, 2)
+        self.assertEqual(printing.sheet_for_duplex(even_path, 'two-sided-long-edge'), even_path)
+        odd_path, odd_pages=printing.prepare_bytes('odd.pdf', one_page('only'), 5)
+        self.assertEqual(odd_pages, 1)
+        padded=printing.sheet_for_duplex(odd_path, 'two-sided-short-edge')
+        self.assertNotEqual(padded, odd_path)
+        self.assertEqual(len(PdfReader(padded).pages), 2)
+        self.assertEqual(printing.sheet_for_duplex(odd_path, 'one-sided'), odd_path)
+        Path(padded).unlink(missing_ok=True)
+        Path(even_path).unlink(missing_ok=True)
+        Path(odd_path).unlink(missing_ok=True)
+
+        msg=EmailMessage()
+        msg['From']='trusted@example.com'
+        msg['To']='print@example.com'
+        msg['Subject']='PRINT DUPLEX'
+        msg.set_content('two files')
+        msg.add_attachment(one_page('first'), maintype='application', subtype='pdf', filename='first.pdf')
+        msg.add_attachment(one_page('second'), maintype='application', subtype='pdf', filename='second.pdf')
+        cfg={'allowed_senders':'','mail_recipient':'','email_pin':'','default_sides':'one-sided','max_files':'5','default_queue':'Office'}
+        seen=[]
+
+        def fake_cmd(*args, **kwargs):
+            path=args[-1]
+            seen.append((Path(path).name, len(PdfReader(path).pages)))
+            return SimpleNamespace(returncode=0, stdout='request id is Office-9 (1 file(s))', stderr='')
+
+        with patch.object(printing, 'cmd', side_effect=fake_cmd):
+            out=mailer.handle_message(msg, 'two-files-1', cfg)
+        self.assertEqual(out['jobs'], 2)
+        self.assertEqual(len(seen), 2)
+        self.assertTrue(all(name.endswith('.sheet.pdf') for name, _pages in seen))
+        self.assertEqual([pages for _name, pages in seen], [2, 2])
+        self.assertNotEqual(seen[0][0], seen[1][0])
+
     def test_rejected_mail_is_listed_with_the_reason(self):
         msg=EmailMessage()
         msg['From']='Stranger <stranger@example.com>'

@@ -9,7 +9,7 @@ import tempfile
 import uuid
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError
-from pypdf import PdfReader
+from pypdf import PdfReader, PdfWriter
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfgen.canvas import Canvas
@@ -267,6 +267,27 @@ def submit_file(filename, data, queue, copies=1, sides='one-sided', source='uplo
             db.execute('UPDATE jobs SET status=?,error=? WHERE id=?', ('error', str(exc)[:500], job_id))
         raise
 
+def sheet_for_duplex(path, sides):
+    """Keep the next document off the back of this one.
+
+    An odd-page duplex job ends on the front of a sheet. A following job can
+    land on that back, so the file sent to CUPS gets one blank page.
+    """
+    if sides not in ('two-sided-long-edge', 'two-sided-short-edge'):
+        return path
+    reader = PdfReader(str(path), strict=False)
+    count = len(reader.pages)
+    if count < 1 or count % 2 == 0:
+        return path
+    writer = PdfWriter()
+    writer.append(reader)
+    box = reader.pages[-1].mediabox
+    writer.add_blank_page(width=float(box.width), height=float(box.height))
+    padded = Path(str(path) + '.' + uuid.uuid4().hex + '.sheet.pdf')
+    with padded.open('wb') as handle:
+        writer.write(handle)
+    return str(padded)
+
 def dispatch(job_id):
     with store.connection() as db:
         record = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
@@ -274,8 +295,13 @@ def dispatch(job_id):
         raise PrintError('Job not found')
     if not record['filepath'] or not Path(record['filepath']).is_file():
         raise PrintError('The saved document is not available for retry')
-    command = ['lp', '-d', record['queue'], '-n', str(record['copies']), '-o', 'sides=' + record['sides'], record['filepath']]
-    result = cmd(*command, timeout=35)
+    print_path = sheet_for_duplex(record['filepath'], record['sides'])
+    command = ['lp', '-d', record['queue'], '-n', str(record['copies']), '-o', 'sides=' + record['sides'], print_path]
+    try:
+        result = cmd(*command, timeout=35)
+    finally:
+        if print_path != record['filepath']:
+            Path(print_path).unlink(missing_ok=True)
     if result.returncode:
         error = (result.stderr or result.stdout or 'CUPS rejected job')[:400]
         with store.connection() as db:
