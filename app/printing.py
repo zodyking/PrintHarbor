@@ -200,18 +200,51 @@ def prepare_bytes(filename, data, max_pages):
             dest.unlink(missing_ok=True)
         raise
 
+def record_rejection(filename, reason, queue='', source='email', sender='', dedupe=None, copies=1, sides='one-sided'):
+    """Keep a received print in the job log when it is turned down before CUPS."""
+    name = ' '.join(str(filename or 'Email').split())[:180] or 'Email'
+    why = ' '.join(str(reason or 'Rejected').split())[:500]
+    target = (queue or '').strip() or '—'
+    try:
+        copies = int(copies)
+    except (TypeError, ValueError):
+        copies = 1
+    if not 1 <= copies <= 10:
+        copies = 1
+    if sides not in SIDES:
+        sides = 'one-sided'
+    with store.connection() as db:
+        if dedupe:
+            existing = db.execute('SELECT id FROM jobs WHERE dedupe=?', (dedupe,)).fetchone()
+            if existing:
+                return existing['id']
+        cur = db.execute(
+            '''INSERT INTO jobs(dedupe,source,sender,filename,queue,copies,sides,status,error)
+               VALUES(?,?,?,?,?,?,?,'rejected',?)''',
+            (dedupe, source, str(sender or '')[:200], name, target, copies, sides, why),
+        )
+        return cur.lastrowid
+
 def submit_file(filename, data, queue, copies=1, sides='one-sided', source='upload', sender='', dedupe=None):
     cfg = store.settings()
     max_mb = max(1, min(int(cfg.get('max_mb', '12')), 30))
-    if len(data) > max_mb * 1024 * 1024:
-        raise PrintError(f'File larger than {max_mb} MB limit')
-    copies = int(copies)
-    if sides not in SIDES or not 1 <= copies <= 10:
-        raise PrintError('Invalid print options')
     safe_name = _safe_filename(filename)
+    if len(data) > max_mb * 1024 * 1024:
+        record_rejection(safe_name, f'File larger than {max_mb} MB limit', queue, source, sender, dedupe, copies, sides)
+        raise PrintError(f'File larger than {max_mb} MB limit')
+    try:
+        copies = int(copies)
+    except (TypeError, ValueError):
+        copies = 0
+    if sides not in SIDES or not 1 <= copies <= 10:
+        record_rejection(safe_name, 'Invalid print options', queue, source, sender, dedupe, 1, sides)
+        raise PrintError('Invalid print options')
     with store.connection() as db:
-        if not db.execute('SELECT 1 FROM printers WHERE queue=?', (queue,)).fetchone():
-            raise PrintError('Printer not configured')
+        configured = db.execute('SELECT 1 FROM printers WHERE queue=?', (queue,)).fetchone()
+    if not configured:
+        record_rejection(safe_name, 'Printer not configured', queue, source, sender, dedupe, copies, sides)
+        raise PrintError('Printer not configured')
+    with store.connection() as db:
         if dedupe:
             existing = db.execute('SELECT id, status FROM jobs WHERE dedupe=?', (dedupe,)).fetchone()
             if existing:

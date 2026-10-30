@@ -39,7 +39,7 @@
       <div class="metrics">
         <div class="metric"><span>Registered printers</span><strong>{{ counts.printers }}</strong><small>Configured CUPS destinations</small></div>
         <div class="metric"><span>Submitted jobs</span><strong>{{ counts.submitted }}</strong><small>Status submitted in the latest 100</small></div>
-        <div class="metric"><span>Attention needed</span><strong>{{ counts.errors }}</strong><small>Failed jobs in the latest 100</small></div>
+        <div class="metric"><span>Attention needed</span><strong>{{ counts.errors }}</strong><small>Failed or rejected in the latest 100</small></div>
         <div class="metric"><span>Email automation</span><strong class="metric-word">{{ mail.state }}</strong><small>{% if mail.detail and mail.state != 'Healthy' %}{{ mail.detail }}{% else %}{{ mail.checked or 'Not checked yet' }}{% endif %}</small></div>
       </div>
       <div class="two-col">
@@ -79,7 +79,7 @@
         {% if jobs %}
         <div class="table-scroll"><table aria-labelledby="recent-jobs-title"><thead><tr><th scope="col">Document</th><th scope="col">Source</th><th scope="col">Printer</th><th scope="col">Pages</th><th scope="col">Status</th></tr></thead><tbody>
           {% for j in jobs[:7] %}
-          <tr><td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC</small></td><td>{{ j.source|title }}</td><td>{{ j.queue }}</td><td>{{ j.pages or '—' }}</td><td><span class="status {% if j.status=='error' %}offline{% elif j.status=='submitted' %}online{% else %}neutral{% endif %}">{{ j.status }}</span></td></tr>
+          <tr><td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC</small>{% if j.error %}<small class="error-txt">{{ j.error }}</small>{% endif %}</td><td>{{ j.source|title }}</td><td>{{ j.queue }}</td><td>{{ j.pages or '—' }}</td><td><span class="status {% if j.status=='error' %}offline{% elif j.status=='rejected' %}warn{% elif j.status=='submitted' %}online{% else %}neutral{% endif %}">{{ j.status }}</span></td></tr>
           {% endfor %}
         </tbody></table></div>
         {% else %}
@@ -160,9 +160,9 @@
       </section>
       {% endif %}
     {% elif page=='jobs' %}
-      <div class="headerline"><div><div class="eyebrow">History</div><h1>Print jobs</h1><p class="muted">Submitted means CUPS accepted the job, not that a page printed.</p></div></div>
+      <div class="headerline"><div><div class="eyebrow">History</div><h1>Print jobs</h1><p class="muted">Every received print is listed. Submitted means CUPS accepted the job, not that a page printed.</p></div></div>
       <section class="panel" aria-labelledby="job-log-title">
-        <div class="panelhead"><div><h2 id="job-log-title">Job log</h2><p>Failed jobs can be retried when the converted file is still stored.</p></div><span class="chip">{{ jobs|length }} recent jobs</span></div>
+        <div class="panelhead"><div><h2 id="job-log-title">Job log</h2><p>Rejected mail stays in this log with the reason. Failed jobs can be retried when the converted file is still stored.</p></div><span class="chip">{{ jobs|length }} recent jobs</span></div>
         {% if jobs %}
         <div class="table-scroll"><table aria-labelledby="job-log-title"><thead><tr><th scope="col">Document</th><th scope="col">Sender</th><th scope="col">Target</th><th scope="col">Pages</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead><tbody>
           {% for j in jobs %}
@@ -171,7 +171,7 @@
             <td>{{ j.sender or j.source|title }}</td>
             <td>{{ j.queue }}{% if j.cups_id %}<small>{{ j.cups_id }}</small>{% endif %}</td>
             <td>{{ j.pages or '—' }} × {{ j.copies }}</td>
-            <td><span class="status {% if j.status=='error' %}offline{% elif j.status=='submitted' %}online{% else %}neutral{% endif %}">{{ j.status }}</span></td>
+            <td><span class="status {% if j.status=='error' %}offline{% elif j.status=='rejected' %}warn{% elif j.status=='submitted' %}online{% else %}neutral{% endif %}">{{ j.status }}</span></td>
             <td>
               {% if j.status=='error' %}
               <form action="/jobs/retry" method="post"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="job_id" value="{{ j.id }}"><button class="textlink" type="submit" aria-label="Retry {{ j.filename }}">Retry</button></form>
@@ -185,7 +185,7 @@
           {% endfor %}
         </tbody></table></div>
         {% else %}
-        <div class="empty">No jobs submitted yet.</div>
+        <div class="empty">No print jobs yet.</div>
         {% endif %}
       </section>
       <section class="panel" aria-labelledby="cups-queue-title">

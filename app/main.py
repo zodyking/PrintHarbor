@@ -93,7 +93,7 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
     jobs = store.records('jobs', 100) if page in ('overview', 'jobs') else []
     counts = {
         'total': len(jobs),
-        'errors': sum(j['status'] == 'error' for j in jobs),
+        'errors': sum(j['status'] in ('error', 'rejected') for j in jobs),
         'submitted': sum(j['status'] == 'submitted' for j in jobs),
         'printers': len(printers),
     }
@@ -153,9 +153,11 @@ def upload(request: Request, token: str = Form(...), printer: str = Form(...), s
         max_mb = max(1, min(int(store.settings().get('max_mb', '12')), 30))
         claimed = request.headers.get('content-length', '')
         if claimed.isdigit() and int(claimed) > max_mb * 1024 * 1024 + 1024 * 1024:
+            printing.record_rejection(file.filename or 'document.pdf', f'File larger than {max_mb} MB limit', printer, 'upload', request.session.get('username') or '')
             return nextpage('overview', error=f'File larger than {max_mb} MB limit')
         contents = file.file.read(max_mb * 1024 * 1024 + 1)
         if len(contents) > max_mb * 1024 * 1024:
+            printing.record_rejection(file.filename or 'document.pdf', f'File larger than {max_mb} MB limit', printer, 'upload', request.session.get('username') or '')
             return nextpage('overview', error=f'File larger than {max_mb} MB limit')
         printing.submit_file(file.filename or 'document.pdf', contents, printer, copies, sides)
         return nextpage('jobs', 'Document submitted to CUPS')
