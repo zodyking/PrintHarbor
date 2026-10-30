@@ -1,0 +1,193 @@
+<!DOCTYPE html>
+<html lang="en" xmlns="http://www.w3.org/1999/xhtml">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width,initial-scale=1">
+  <meta name="x-apple-disable-message-reformatting">
+  <meta name="color-scheme" content="light">
+  <title>{{ title }}</title>
+  <style>
+    html,body { margin:0!important; padding:0!important; width:100%!important; }
+    * { -ms-text-size-adjust:100%; -webkit-text-size-adjust:100%; }
+    table,td { mso-table-lspace:0pt!important; mso-table-rspace:0pt!important; }
+    table { border-spacing:0; border-collapse:collapse; }
+    img { -ms-interpolation-mode:bicubic; }
+    a { text-decoration:none; }
+    .content-pad { padding-left:55px!important; padding-right:55px!important; }
+    @media only screen and (max-width:640px) {
+      .outer { padding:0!important; }
+      .shell { width:100%!important; max-width:100%!important; border-radius:0!important; }
+      .content-pad { padding-left:27px!important; padding-right:27px!important; }
+      .hero { font-size:34px!important; line-height:40px!important; letter-spacing:-1.3px!important; }
+      .status-value { font-size:22px!important; line-height:30px!important; }
+      .setting-col { display:block!important; width:100%!important; padding:0 0 14px!important; }
+      .setting-last { padding-bottom:0!important; }
+      .footer-pad { padding-left:27px!important; padding-right:27px!important; }
+    }
+  </style>
+</head>
+<body style="margin:0;padding:0;background-color:#f6f7f9;color:#17191f;font-family:Arial,Helvetica,sans-serif;">
+  <div style="display:none;font-size:1px;line-height:1px;color:#f6f7f9;max-height:0;max-width:0;opacity:0;overflow:hidden;mso-hide:all;">
+    {{ preview }}
+  </div>
+  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f6f7f9" style="width:100%;background-color:#f6f7f9;">
+    <tr>
+      <td class="outer" align="center" style="padding:54px 20px 34px;">
+        <!--[if mso]>
+        <table role="presentation" align="center" width="600" cellpadding="0" cellspacing="0"><tr><td>
+        <![endif]-->
+        <table role="presentation" class="shell" width="600" cellpadding="0" cellspacing="0" border="0" bgcolor="#ffffff" style="width:600px;max-width:600px;background:#ffffff;border:1px solid #e9ebef;border-radius:12px;">
+          <tr>
+            <td class="content-pad" style="padding:32px 55px;border-bottom:1px solid #ebedf0;">
+              <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td valign="middle" width="39" height="39" align="center" bgcolor="#17191f" style="width:39px;height:39px;background-color:#17191f;border-radius:10px;color:#ffffff;font-size:13px;line-height:39px;font-weight:700;letter-spacing:-0.3px;">
+                    PH
+                  </td>
+                  <td valign="middle" style="padding-left:11px;font-size:20px;line-height:25px;letter-spacing:-0.8px;font-weight:700;color:#181a20;">
+                    Print Harbor<span style="color:#6381ff;">.</span>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td class="content-pad" style="padding:49px 55px 0;">
+              <div style="font-size:10px;line-height:16px;letter-spacing:1.8px;font-weight:700;color:#69707b;">
+                {{ eyebrow }}
+              </div>
+              <h1 class="hero" style="margin:18px 0 16px;font-size:41px;line-height:48px;letter-spacing:-1.75px;color:#17191f;font-weight:700;">
+                {{ hero_line_1 }}<br>{{ hero_line_2 }}
+              </h1>
+              <p style="margin:0;font-size:15px;line-height:25px;color:#636a75;">
+                {{ intro }}
+              </p>
+            </td>
+          </tr>
+          <tr>
+            <td class="content-pad" style="padding:36px 55px 0;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" bgcolor="#f8f9fb" style="width:100%;background-color:#f8f9fb;border:1px solid #e7e9ed;border-radius:10px;">
+                <tr>
+                  <td align="center" style="padding:32px 22px 29px;">
+                    <div style="font-size:10px;line-height:16px;letter-spacing:1.8px;font-weight:700;color:#767e89;">
+                      {{ card_label }}
+                    </div>
+                    <div class="status-value" style="padding:13px 0 12px;font-size:22px;font-weight:700;line-height:30px;letter-spacing:-0.4px;color:#17191f;">
+                      {{ card_value }}
+                    </div>
+                    <div style="font-size:12px;line-height:20px;color:#767d89;">
+                      {{ card_note }}
+                    </div>
+                  </td>
+                </tr>
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td class="content-pad" style="padding:45px 55px 0;">
+              <h2 style="margin:0 0 23px;color:#17191f;font-weight:700;letter-spacing:-0.45px;font-size:17px;line-height:23px;">
+                What happened
+              </h2>
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                {% for step in steps %}
+                <tr>
+                  <td valign="top" width="38" style="padding:0 0 {% if loop.last %}0{% else %}20px{% endif %};font-size:12px;font-weight:700;color:#9ca2ab;line-height:23px;">
+                    {{ step.number }}
+                  </td>
+                  <td valign="top" style="padding:0 0 {% if loop.last %}0{% else %}20px{% endif %};font-size:14px;line-height:23px;color:#616874;">
+                    <strong style="font-weight:700;color:#252830;">{{ step.title }}</strong>
+                    {{ step.body }}
+                  </td>
+                </tr>
+                {% endfor %}
+              </table>
+            </td>
+          </tr>
+          <tr>
+            <td class="content-pad" style="padding:43px 55px 48px;">
+              <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                <tr>
+                  <td style="border-top:1px solid #e9ebef;padding-top:29px;">
+                    <div style="font-size:17px;line-height:23px;letter-spacing:-0.4px;font-weight:700;color:#17191f;">
+                      Your documents
+                    </div>
+                  </td>
+                </tr>
+                <tr>
+                  <td style="padding-top:23px;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0">
+                      {% for file in files %}
+                      <tr>
+                        <td width="39" valign="top" style="width:39px;padding:0 0 17px;">
+                          <table role="presentation" cellpadding="0" cellspacing="0" border="0">
+                            <tr>
+                              <td width="34" height="38" align="center" valign="middle" bgcolor="#f4f5f7" style="width:34px;height:38px;border:1px solid #e9ebee;border-radius:5px;color:#5a606d;font-weight:700;font-size:9px;line-height:38px;">
+                                {{ file.extension }}
+                              </td>
+                            </tr>
+                          </table>
+                        </td>
+                        <td valign="top" style="padding:1px 0 17px 10px;">
+                          <div style="font-size:13px;line-height:19px;font-weight:700;color:#292c34;word-break:break-word;">
+                            {{ file.name }}
+                          </div>
+                          <div style="padding-top:3px;font-size:12px;line-height:18px;color:#9299a3;">
+                            {{ file.description }}
+                          </div>
+                        </td>
+                      </tr>
+                      {% endfor %}
+                    </table>
+                  </td>
+                </tr>
+                {% if printer or settings_line %}
+                <tr>
+                  <td style="padding-top:5px;border-top:1px solid #eff0f2;">
+                    <table role="presentation" width="100%" cellpadding="0" cellspacing="0" border="0" style="margin-top:21px;">
+                      <tr>
+                        <td valign="top" class="setting-col" width="47%" style="width:47%;padding-right:16px;">
+                          <div style="font-size:10px;line-height:15px;font-weight:700;letter-spacing:1px;color:#989ea8;">
+                            PRINTER
+                          </div>
+                          <div style="padding-top:7px;font-size:13px;line-height:20px;color:#383d46;">
+                            {{ printer or 'Not assigned' }}
+                          </div>
+                        </td>
+                        <td valign="top" class="setting-col setting-last" width="53%" style="width:53%;">
+                          <div style="font-size:10px;line-height:15px;font-weight:700;letter-spacing:1px;color:#989ea8;">
+                            PRINT SETTINGS
+                          </div>
+                          <div style="padding-top:7px;font-size:13px;line-height:20px;color:#383d46;">
+                            {{ settings_line or 'Not applied' }}
+                          </div>
+                        </td>
+                      </tr>
+                    </table>
+                  </td>
+                </tr>
+                {% endif %}
+              </table>
+            </td>
+          </tr>
+        </table>
+        <!--[if mso]></td></tr></table><![endif]-->
+        <table role="presentation" width="600" cellpadding="0" cellspacing="0" border="0" class="shell" style="width:600px;max-width:600px;">
+          <tr>
+            <td class="footer-pad" align="center" style="padding:28px 40px 45px;">
+              <p style="margin:0 0 8px;color:#737a84;font-size:11px;line-height:19px;font-weight:700;">
+                Print Harbor
+              </p>
+              <p style="margin:0;color:#9aa1ab;font-size:11px;line-height:19px;">
+                Private printing, on your terms.
+              </p>
+              <p style="margin:8px 0 0;color:#a7adb5;font-size:10px;line-height:17px;">
+                Automated result for this message. The original mail was left in the mailbox.
+              </p>
+            </td>
+          </tr>
+        </table>
+      </td>
+    </tr>
+  </table>
+</body>
+</html>
