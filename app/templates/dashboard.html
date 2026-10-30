@@ -1,0 +1,260 @@
+{% set labels = {'overview':'Overview','printers':'Printers','jobs':'Print jobs','email':'Email automation'} %}
+{% set side_labels = {'one-sided':'Single-sided','two-sided-long-edge':'Long-edge duplex','two-sided-short-edge':'Short-edge duplex'} %}
+{% set tone = 'good' if mail.state=='Healthy' else ('bad' if mail.state=='Error' else 'warn') %}
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>PrintHarbor · {{ labels[page] }}</title>
+  <link rel="stylesheet" href="/static/style.css?v=2">
+</head>
+<body>
+<a class="skip" href="#content">Skip to content</a>
+<div class="layout">
+<aside class="sidebar">
+  <a href="/" class="brand"><span class="brand-logo" aria-hidden="true">P<span>H</span></span><span><strong>PrintHarbor</strong><small>Print operations</small></span></a>
+  <div class="sidebar-label">Workspace</div>
+  <nav aria-label="Primary">
+    <ul class="navlist">
+      <li><a class="navlink {% if page=='overview' %}active{% endif %}" {% if page=='overview' %}aria-current="page"{% endif %} href="/?page=overview"><span class="nav-icon" aria-hidden="true">◫</span> Overview</a></li>
+      <li><a class="navlink {% if page=='printers' %}active{% endif %}" {% if page=='printers' %}aria-current="page"{% endif %} href="/?page=printers"><span class="nav-icon" aria-hidden="true">▣</span> Printers</a></li>
+      <li><a class="navlink {% if page=='jobs' %}active{% endif %}" {% if page=='jobs' %}aria-current="page"{% endif %} href="/?page=jobs"><span class="nav-icon" aria-hidden="true">≡</span> Print jobs</a></li>
+      <li><a class="navlink {% if page=='email' %}active{% endif %}" {% if page=='email' %}aria-current="page"{% endif %} href="/?page=email"><span class="nav-icon" aria-hidden="true">✉</span> Email automation</a></li>
+    </ul>
+  </nav>
+  <div class="sidebar-bottom">
+    <div class="tail-info"><span class="green-dot {% if not tail.online %}is-warn{% endif %}"></span><div><strong>Tailscale {{ tail.state }}</strong><small>{{ tail.ip or "No tailnet address" }}</small></div></div>
+    <form method="post" action="/logout"><input type="hidden" name="token" value="{{ token }}"><button class="signout" type="submit">Sign out</button></form>
+  </div>
+</aside>
+<main class="main">
+  <header class="topbar"><div class="crumbs">PrintHarbor <span>/</span> {{ labels[page] }}</div><div class="user-badge"><span class="avatar" aria-hidden="true">{{ name[0]|upper }}</span> <span>{{ name }}</span></div></header>
+  <div class="content" id="content">
+    {% if notice %}<div class="alert good" role="status">{{ notice }}</div>{% endif %}
+    {% if error %}<div class="alert bad" role="alert">{{ error }}</div>{% endif %}
+    {% if page=='overview' %}
+      <div class="headerline"><div><div class="eyebrow">Overview</div><h1>Overview</h1><p class="muted">Printers, jobs, and intake status.</p></div><a class="button subtle" href="/?page=email">Email automation <span aria-hidden="true">→</span></a></div>
+      <div class="metrics">
+        <div class="metric"><span>Registered printers</span><strong>{{ counts.printers }}</strong><small>Configured CUPS destinations</small></div>
+        <div class="metric"><span>Submitted jobs</span><strong>{{ counts.submitted }}</strong><small>Status submitted in the latest 100</small></div>
+        <div class="metric"><span>Attention needed</span><strong>{{ counts.errors }}</strong><small>Failed jobs in the latest 100</small></div>
+        <div class="metric"><span>Email automation</span><strong class="metric-word">{{ mail.state }}</strong><small>{% if mail.detail and mail.state != 'Healthy' %}{{ mail.detail }}{% else %}{{ mail.checked or 'Not checked yet' }}{% endif %}</small></div>
+      </div>
+      <div class="two-col">
+        <section class="panel" aria-labelledby="quick-print-title">
+          <div class="panelhead"><div><h2 id="quick-print-title">Quick print</h2><p>Upload a document to a configured queue.</p></div><span class="chip">PDF, Office, images, text</span></div>
+          {% if printers %}
+          <form action="/jobs/upload" method="post" enctype="multipart/form-data" class="form-stack">
+            <input type="hidden" name="token" value="{{ token }}">
+            <label class="upload-area"><span class="upload-icon" aria-hidden="true">↑</span><strong>Choose a document</strong><small>PDF, JPG, PNG, TIFF, WEBP, DOCX, XLSX, ODT, ODS, TXT</small><input required type="file" name="file" accept=".pdf,.jpg,.jpeg,.png,.webp,.tif,.tiff,.docx,.xlsx,.odt,.ods,.txt"></label>
+            <div class="form-row">
+              <label>Destination<select name="printer" required>{% for p in printers %}<option value="{{ p.queue }}">{{ p.label }}</option>{% endfor %}</select></label>
+              <label>Layout<select name="sides"><option value="one-sided">Single-sided</option><option value="two-sided-long-edge">Two-sided, long edge</option><option value="two-sided-short-edge">Two-sided, short edge</option></select></label>
+              <label>Copies<input name="copies" type="number" min="1" max="10" value="1" inputmode="numeric"></label>
+            </div>
+            <button class="button" type="submit">Send to printer <span aria-hidden="true">→</span></button>
+          </form>
+          {% else %}
+          <div class="empty">No printers configured. <a href="/?page=printers">Add a printer.</a></div>
+          {% endif %}
+        </section>
+        <section class="panel" aria-labelledby="printer-status-title">
+          <div class="panelhead"><div><h2 id="printer-status-title">Printer status</h2><p>TCP check on port 631 for IPP, or 9100 for raw.</p></div></div>
+          {% if printers %}
+          <div class="printer-list">
+            {% for p in printers %}
+            <div class="printer-line"><div class="printer-glyph" aria-hidden="true">▣</div><div><strong>{{ p.label }}</strong><small>{{ p.host }} · {{ p.protocol|upper }} · {{ p.queue }}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span></div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <div class="empty">Printers appear here after a queue is added.</div>
+          {% endif %}
+          <a class="footlink" href="/?page=printers">Printer setup</a>
+        </section>
+      </div>
+      <section class="panel" aria-labelledby="recent-jobs-title">
+        <div class="panelhead"><div><h2 id="recent-jobs-title">Recent jobs</h2><p>Submitted means CUPS accepted the job, not that a page printed.</p></div><a class="textlink" href="/?page=jobs">All jobs</a></div>
+        {% if jobs %}
+        <div class="table-scroll"><table aria-labelledby="recent-jobs-title"><thead><tr><th scope="col">Document</th><th scope="col">Source</th><th scope="col">Printer</th><th scope="col">Pages</th><th scope="col">Status</th></tr></thead><tbody>
+          {% for j in jobs[:7] %}
+          <tr><td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC</small></td><td>{{ j.source|title }}</td><td>{{ j.queue }}</td><td>{{ j.pages or '—' }}</td><td><span class="status {% if j.status=='error' %}offline{% elif j.status=='submitted' %}online{% else %}neutral{% endif %}">{{ j.status }}</span></td></tr>
+          {% endfor %}
+        </tbody></table></div>
+        {% else %}
+        <div class="empty">No print jobs yet.</div>
+        {% endif %}
+      </section>
+    {% elif page=='printers' %}
+      <div class="headerline"><div><div class="eyebrow">Queues</div><h1>Printers</h1><p class="muted">Register an IPP queue or a raw port 9100 queue.</p></div></div>
+      <div class="two-col">
+        <section class="panel" aria-labelledby="destinations-title">
+          <div class="panelhead"><div><h2 id="destinations-title">Connected destinations</h2><p>{{ printers|length }} registered print {{ 'queue' if printers|length==1 else 'queues' }}.</p></div></div>
+          {% if printers %}
+          <div class="printer-list">
+            {% for p in printers %}
+            <div class="printer-line expand"><div class="printer-glyph" aria-hidden="true">▣</div><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.queue }} · {{ p.host }} · {{ p.protocol|upper }}</small><small>{% if p.pages_total %}SNMP lifetime page count: {{ p.pages_total }}{% else %}SNMP page count not available{% endif %}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer queue {{ p.queue }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.queue }}">Remove</button></form></div>
+            {% endfor %}
+          </div>
+          {% else %}
+          <div class="empty">No printer added yet.</div>
+          {% endif %}
+        </section>
+        <section class="panel" aria-labelledby="add-printer-title">
+          <div class="panelhead"><div><h2 id="add-printer-title">Add a printer</h2><p>Use the printer address reachable from this host.</p></div></div>
+          <form class="form-stack" method="post" action="/printers/add">
+            <input type="hidden" name="token" value="{{ token }}">
+            <label>Display name<input name="label" placeholder="Brother HL-L2380DW" required maxlength="100"></label>
+            <label>CUPS queue name<input name="queue" placeholder="Office_Brother" required pattern="[A-Za-z][A-Za-z0-9_-]{0,40}" maxlength="41" autocapitalize="off" spellcheck="false"></label>
+            <label>Printer IPv4<input name="host" required placeholder="192.168.50.40" inputmode="decimal" autocomplete="off" spellcheck="false"></label>
+            <label>Connection<select name="protocol" aria-describedby="protocol-help"><option value="ipp">IPP</option><option value="socket">Raw port 9100</option></select></label>
+            <p id="protocol-help" class="form-help">IPP uses <code>ipp://address/ipp/print</code>. If IPP Everywhere fails, the error from CUPS is shown and the queue is not marked as added.</p>
+            <button class="button" type="submit">Create printer queue <span aria-hidden="true">→</span></button>
+          </form>
+        </section>
+      </div>
+      <section class="panel" aria-labelledby="cups-status-title">
+        <div class="panelhead"><div><h2 id="cups-status-title">CUPS queues</h2><p>Live listing from the local CUPS service.</p></div></div>
+        {% if not cups_report.ok %}
+        <div class="alert bad" role="alert">CUPS is not available. {{ cups_report.error }}</div>
+        {% elif cups_report.lines %}
+        <div class="queue-lines">{% for line in cups_report.lines %}<div>{{ line }}</div>{% endfor %}</div>
+        {% else %}
+        <div class="empty">CUPS reported no queues.</div>
+        {% endif %}
+      </section>
+      <section class="panel" aria-labelledby="route-title">
+        <h2 id="route-title">Tailscale route</h2>
+        <div class="check-grid">
+          <div><b>01</b><strong>Subnet route to the printer</strong><p>An always-on device on the printer LAN must advertise that printer's address, preferably as a /32.</p></div>
+          <div><b>02</b><strong>Approve the route</strong><p>Approve it in the Tailscale admin console and allow this node in the tailnet policy.</p></div>
+          <div><b>03</b><strong>Use the printer LAN address</strong><p>This host's Tailscale client accepts advertised routes. Enter that LAN address above, not a public address.</p></div>
+        </div>
+      </section>
+    {% elif page=='jobs' %}
+      <div class="headerline"><div><div class="eyebrow">History</div><h1>Print jobs</h1><p class="muted">Submitted means CUPS accepted the job, not that a page printed.</p></div></div>
+      <section class="panel" aria-labelledby="job-log-title">
+        <div class="panelhead"><div><h2 id="job-log-title">Job log</h2><p>Failed jobs can be retried when the converted file is still stored.</p></div><span class="chip">{{ jobs|length }} recent jobs</span></div>
+        {% if jobs %}
+        <div class="table-scroll"><table aria-labelledby="job-log-title"><thead><tr><th scope="col">Document</th><th scope="col">Sender</th><th scope="col">Target</th><th scope="col">Pages</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead><tbody>
+          {% for j in jobs %}
+          <tr>
+            <td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC · {{ side_labels.get(j.sides, j.sides) }}</small>{% if j.error %}<small class="error-txt">{{ j.error }}</small>{% endif %}</td>
+            <td>{{ j.sender or j.source|title }}</td>
+            <td>{{ j.queue }}{% if j.cups_id %}<small>{{ j.cups_id }}</small>{% endif %}</td>
+            <td>{{ j.pages or '—' }} × {{ j.copies }}</td>
+            <td><span class="status {% if j.status=='error' %}offline{% elif j.status=='submitted' %}online{% else %}neutral{% endif %}">{{ j.status }}</span></td>
+            <td>
+              {% if j.status=='error' %}
+              <form action="/jobs/retry" method="post"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="job_id" value="{{ j.id }}"><button class="textlink" type="submit" aria-label="Retry {{ j.filename }}">Retry</button></form>
+              {% elif j.cups_id and j.status=='submitted' %}
+              <form action="/jobs/cancel" method="post"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="cups_id" value="{{ j.cups_id }}"><button class="textlink" type="submit" aria-label="Cancel {{ j.cups_id }}">Cancel</button></form>
+              {% elif j.status=='submitted' %}
+              <small>No CUPS id</small>
+              {% endif %}
+            </td>
+          </tr>
+          {% endfor %}
+        </tbody></table></div>
+        {% else %}
+        <div class="empty">No jobs submitted yet.</div>
+        {% endif %}
+      </section>
+      <section class="panel" aria-labelledby="cups-queue-title">
+        <div class="panelhead"><div><h2 id="cups-queue-title">Current CUPS queue</h2><p>Jobs CUPS still has active. This is separate from the log above.</p></div></div>
+        {% if not active_jobs.ok %}
+        <div class="alert bad" role="alert">CUPS queue is unavailable. {{ active_jobs.error }}</div>
+        {% elif active_jobs.lines %}
+        <div class="queue-lines">{% for line in active_jobs.lines %}<div>{{ line }}</div>{% endfor %}</div>
+        {% else %}
+        <div class="empty">No active jobs in CUPS.</div>
+        {% endif %}
+      </section>
+    {% elif page=='email' %}
+      <div class="headerline">
+        <div><div class="eyebrow">Intake</div><h1>Email automation</h1><p class="muted">Allowlisted mail with the subject PIN prints to the default queue.</p></div>
+        <div class="mail-health is-{{ tone }}"><span class="green-dot {% if tone=='bad' %}is-bad{% elif tone!='good' %}is-warn{% endif %}"></span><div><strong>{{ mail.state }}</strong><small>{{ mail.detail or mail.checked or 'Not checked yet' }}</small></div></div>
+      </div>
+      <section class="panel" aria-labelledby="mailbox-title">
+        <div class="panelhead"><div><h2 id="mailbox-title">Mailbox and automation</h2><p>Saved settings apply on the next inbox poll.</p></div><span class="chip">IMAP over TLS</span></div>
+        <form method="post" action="/settings/save" class="form-stack">
+          <input type="hidden" name="token" value="{{ token }}">
+          <div class="section-title">Mail connection</div>
+          <div class="form-row">
+            <label>IMAP server<input name="imap_host" required value="{{ config.imap_host }}" placeholder="imap.gmail.com" autocapitalize="off" spellcheck="false"></label>
+            <label>Port<input type="number" name="imap_port" min="1" max="65535" value="{{ config.imap_port }}" inputmode="numeric"></label>
+          </div>
+          <div class="form-row">
+            <label>Mailbox email<input type="email" name="imap_user" value="{{ config.imap_user }}" placeholder="printer@gmail.com" autocomplete="off"></label>
+            <label>App password<input type="password" name="imap_password" autocomplete="new-password" placeholder="{% if config.imap_password %}Saved. Leave blank to keep{% else %}Enter app password{% endif %}"><small>Spaces are removed so a Gmail app password can be pasted as shown. Leave blank to keep the saved password.</small></label>
+          </div>
+          <label>IMAP folder<input name="imap_folder" value="{{ config.imap_folder }}" required autocapitalize="off" spellcheck="false"></label>
+          <div class="section-title">Security controls</div>
+          <label>Approved sender emails<input name="allowed_senders" value="{{ config.allowed_senders }}" placeholder="you@gmail.com, home@gmail.com" autocapitalize="off" spellcheck="false"><small>Only these exact addresses can submit jobs. Separate them with commas.</small></label>
+          <label>Required destination email<input name="mail_recipient" type="email" value="{{ config.mail_recipient }}" placeholder="printer@gmail.com"><small>Optional. When set, To or Cc must include this address.</small></label>
+          <label>Email subject PIN<input name="new_pin" minlength="6" maxlength="32" pattern="[A-Za-z0-9]{6,32}" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Leave blank to keep current"><small>Current PIN: <code>{{ config.email_pin or 'not set' }}</code>. The sender list does not stop a spoofed From address. Use 6 to 32 letters or digits.</small></label>
+          <div class="section-title">Print behavior</div>
+          {% if not printers %}<p class="form-help">Add a printer before email intake can submit jobs.</p>{% endif %}
+          <div class="form-row">
+            <label>Default printer<select name="default_queue"><option value="">Select printer</option>{% for p in printers %}<option value="{{ p.queue }}" {% if config.default_queue==p.queue %}selected{% endif %}>{{ p.label }}</option>{% endfor %}</select></label>
+            <label>Default sides<select name="default_sides"><option value="one-sided" {% if config.default_sides=='one-sided' %}selected{% endif %}>Single-sided</option><option value="two-sided-long-edge" {% if config.default_sides=='two-sided-long-edge' %}selected{% endif %}>Long-edge duplex</option><option value="two-sided-short-edge" {% if config.default_sides=='two-sided-short-edge' %}selected{% endif %}>Short-edge duplex</option></select><small>Used when the subject does not say DUPLEX, 2-SIDED, or SHORT EDGE.</small></label>
+          </div>
+          <div class="form-row">
+            <label>Maximum pages per file<input type="number" name="max_pages" min="1" max="200" value="{{ config.max_pages }}" inputmode="numeric"></label>
+            <label>Maximum file size (MB)<input type="number" name="max_mb" min="1" max="30" value="{{ config.max_mb }}" inputmode="numeric"></label>
+            <label>Attachments per message<input type="number" name="max_files" min="1" max="10" value="{{ config.max_files }}" inputmode="numeric"></label>
+            <label>Poll interval (seconds)<input type="number" name="poll_seconds" min="20" max="3600" value="{{ config.poll_seconds }}" inputmode="numeric"></label>
+          </div>
+          <div class="toggles">
+            <label class="toggle"><input type="checkbox" name="mail_enabled" value="1" {% if config.mail_enabled=='1' %}checked{% endif %}><span><strong>Enable automatic email printing</strong><small>Poll unread messages and submit supported attachments.</small></span></label>
+            <label class="toggle"><input type="checkbox" name="print_email_body" value="1" {% if config.print_email_body=='1' %}checked{% endif %}><span><strong>Print plain-text body as fallback</strong><small>Only when the message has no supported attachment.</small></span></label>
+          </div>
+          <button class="button" type="submit">Save automation settings <span aria-hidden="true">→</span></button>
+        </form>
+      </section>
+      <div class="two-col">
+        <section class="panel" aria-labelledby="examples-title">
+          <h2 id="examples-title">Subject examples</h2>
+          <p class="muted">Replace the PIN below with the current PIN if you rotate it.</p>
+          <div class="command-example"><span>Single-sided</span><code>PRINT PIN:{{ config.email_pin or 'YOURPIN' }}</code></div>
+          <div class="command-example"><span>Long-edge duplex</span><code>PRINT PIN:{{ config.email_pin or 'YOURPIN' }} DUPLEX</code></div>
+          <div class="command-example"><span>3 copies, duplex</span><code>PRINT PIN:{{ config.email_pin or 'YOURPIN' }} DUPLEX COPIES=3</code></div>
+          <div class="command-example"><span>Short-edge duplex</span><code>PRINT PIN:{{ config.email_pin or 'YOURPIN' }} SHORT EDGE</code></div>
+        </section>
+        <section class="panel" aria-labelledby="security-title">
+          <h2 id="security-title">What is enforced</h2>
+          <ul class="plainlist">
+            <li>Exact sender allowlist and a mandatory subject PIN</li>
+            <li>IMAP over TLS, with the mailbox password encrypted at rest</li>
+            <li>Attachment size, count, and PDF page limits</li>
+            <li>UID deduplication so a seen message is not printed twice</li>
+            <li>Rejected mail is kept in the event log, not described as healthy</li>
+            <li>Dashboard actions require the signed-in session and a request token</li>
+          </ul>
+        </section>
+      </div>
+    {% endif %}
+    {% if page=='overview' or page=='email' %}
+    <section class="panel" aria-labelledby="event-log-title">
+      <div class="panelhead"><div><h2 id="event-log-title">Event log</h2><p>Mail rejections, CUPS results, and configuration changes.</p></div></div>
+      {% if events %}
+      <div class="table-scroll"><table aria-labelledby="event-log-title"><thead><tr><th scope="col">When</th><th scope="col">Level</th><th scope="col">Message</th></tr></thead><tbody>
+        {% for e in events %}
+        <tr>
+          <td>{{ e.created_at }} UTC</td>
+          <td><span class="status {% if e.level=='error' %}offline{% elif e.level=='success' %}online{% elif e.level=='warning' %}warn{% else %}neutral{% endif %}">{{ e.level }}</span></td>
+          <td class="wrap">{{ e.message }}</td>
+        </tr>
+        {% endfor %}
+      </tbody></table></div>
+      {% else %}
+      <div class="empty">No events recorded yet.</div>
+      {% endif %}
+    </section>
+    {% endif %}
+    <footer>PrintHarbor <span>Jobs stay on this host. CUPS acceptance is not a printed page.</span></footer>
+  </div>
+</main>
+</div>
+</body>
+</html>
