@@ -64,7 +64,7 @@ These are the dashboard on a fresh local session. No printer, mailbox, or tailne
 - Optional Tailscale auth key (`TS_AUTHKEY`) when you use the included Compose file
 - Optional `snmpget` and `SNMP_COMMUNITY` for the lifetime page counter
 
-The Docker image installs CUPS, LibreOffice, and the related tools. `start.sh` starts `cupsd`, then Uvicorn on port 8000 inside the container.
+The Docker image installs CUPS, LibreOffice, and the related tools. `start.sh` starts `cupsd`, then Uvicorn on port 47831 inside the container.
 
 ## Setup
 
