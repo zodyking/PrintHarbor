@@ -21,7 +21,7 @@ services:
       - NET_ADMIN
       - NET_RAW
     ports:
-      - "127.0.0.1:8765:8000"
+      - "127.0.0.1:8765:47831"
     restart: unless-stopped
 
   printharbor:
