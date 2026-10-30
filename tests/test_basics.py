@@ -240,6 +240,124 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(mailer.summarize_poll(0,0)[0],'Healthy')
         self.assertEqual(mailer.summarize_poll(2,1)[0],'Attention')
 
+    def test_blank_allowlist_accepts_any_sender(self):
+        msg=EmailMessage()
+        msg['From']='stranger@example.com'
+        msg['To']='print@example.com'
+        msg['Subject']='PRINT PIN:abcdef12'
+        open_list={'allowed_senders':'','mail_recipient':'','email_pin':'abcdef12','default_sides':'one-sided'}
+        self.assertTrue(mailer.allowed_message(msg, open_list)[0])
+        closed=dict(open_list, allowed_senders='trusted@example.com')
+        self.assertFalse(mailer.allowed_message(msg, closed)[0])
+        closed['mail_recipient']='print@example.com'
+        msg.replace_header('From','trusted@example.com')
+        self.assertTrue(mailer.allowed_message(msg, closed)[0])
+        msg.replace_header('To','other@example.com')
+        self.assertFalse(mailer.allowed_message(msg, closed)[0])
+
+    def test_disabled_badge_points_at_this_page(self):
+        store.set_setting('mail_enabled','0')
+        mailer.check_once()
+        self.assertEqual(mailer.snapshot()['detail'], 'Turn on automatic email printing below, then save.')
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with TestClient(app) as client:
+            client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+            page=client.get('/?page=email')
+            self.assertIn('Turn on automatic email printing below, then save.', page.text)
+            self.assertIn('Enable automatic email printing', page.text)
+            self.assertIn('Leave blank to accept mail from any sender', page.text)
+            self.assertLess(page.text.find('Enable automatic email printing'), page.text.find('IMAP server'))
+
+    def test_folder_decoding_and_list_does_not_save(self):
+        self.assertEqual(mailer.decode_imap_utf7('INBOX'), 'INBOX')
+        self.assertEqual(mailer.decode_imap_utf7('A&-B'), 'A&B')
+        self.assertEqual(mailer.decode_imap_utf7('&AOk-'), '\u00e9')
+        self.assertEqual(mailer.mailbox_name(b'(\\HasNoChildren) "/" "INBOX"'), 'INBOX')
+        self.assertEqual(mailer.mailbox_name(b'(\\HasNoChildren) "/" "&AOk-"'), '\u00e9')
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with TestClient(app) as client:
+            client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+            before=store.settings()['poll_seconds']
+            page=client.get('/?page=email')
+            token=re.search(r'name="token" value="([^"]+)"', page.text).group(1)
+            with patch('app.mailer.list_folders', return_value=['INBOX', 'Print']):
+                loaded=client.post('/mail/folders', data=self._settings(token, poll_seconds='333', imap_user='print@example.com', imap_password='app-pass-value'))
+            self.assertEqual(loaded.status_code, 200)
+            self.assertIn('Folders loaded', loaded.text)
+            self.assertIn('>Print<', loaded.text)
+            self.assertNotIn('app-pass-value', loaded.text)
+            self.assertEqual(store.settings()['poll_seconds'], before)
+
+    def test_result_email_uses_alias_from(self):
+        msg=EmailMessage()
+        msg['From']='Person <person@example.com>'
+        msg['Subject']='PRINT PIN:abcdef12'
+        msg['Message-ID']='<job@example.com>'
+        config={
+            'reply_enabled':'1','smtp_from':'printme@example.com','imap_user':'devon@example.com',
+            'imap_password':'secret-pass','smtp_host':'smtp.gmail.com','smtp_port':'587',
+        }
+        result={'accepted':True,'jobs':2,'errors':0,'reason':'','queue':'Office','notes':['a.pdf accepted by CUPS for Office']}
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                self.host=host
+                self.port=port
+                self.messages=[]
+                FakeSMTP.last=self
+            def ehlo(self):
+                return None
+            def starttls(self):
+                self.tls=True
+            def login(self, user, password):
+                self.login_args=(user, password)
+            def send_message(self, message):
+                self.messages.append(message)
+            def quit(self):
+                return None
+
+        with patch('app.mailer.smtplib.SMTP', FakeSMTP):
+            mailer.notify_sender(msg, config, result)
+        sent=FakeSMTP.last.messages[0]
+        self.assertEqual(FakeSMTP.last.login_args, ('devon@example.com','secret-pass'))
+        self.assertTrue(FakeSMTP.last.tls)
+        self.assertEqual(sent['From'], 'printme@example.com')
+        self.assertEqual(sent['To'], 'person@example.com')
+        self.assertEqual(sent['Subject'], 'Re: PRINT PIN:abcdef12')
+        self.assertEqual(sent['In-Reply-To'], '<job@example.com>')
+        self.assertIn('accepted 2 file(s) for Office', sent.get_content())
+        self.assertNotIn('secret-pass', sent.get_content())
+        config['reply_enabled']='0'
+        with patch('app.mailer.smtplib.SMTP') as smtp:
+            mailer.notify_sender(msg, config, result)
+            smtp.assert_not_called()
+        config['reply_enabled']='1'
+        config['smtp_port']='465'
+        with patch('app.mailer.smtplib.SMTP_SSL', FakeSMTP), patch('app.mailer.smtplib.SMTP') as plain:
+            mailer.notify_sender(msg, config, result)
+            plain.assert_not_called()
+        self.assertEqual(FakeSMTP.last.port, 465)
+
+    def test_save_keeps_password_and_stores_from_address(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with TestClient(app) as client:
+            client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+            page=client.get('/?page=email')
+            token=re.search(r'name="token" value="([^"]+)"', page.text).group(1)
+            client.post('/settings/save', data=self._settings(token, imap_password='kept-password', smtp_from='printme@example.com', reply_enabled='1', allowed_senders=''), follow_redirects=False)
+            kept=client.post('/settings/save', data=self._settings(token, smtp_from='printme@example.com', reply_enabled='1', allowed_senders=''), follow_redirects=False)
+            self.assertEqual(kept.status_code, 303)
+            cfg=store.settings()
+            self.assertEqual(cfg['imap_password'], 'kept-password')
+            self.assertEqual(cfg['smtp_from'], 'printme@example.com')
+            self.assertEqual(cfg['smtp_host'], 'smtp.gmail.com')
+            self.assertEqual(cfg['smtp_port'], '587')
+            self.assertEqual(cfg['allowed_senders'], '')
+            self.assertEqual(cfg['reply_enabled'], '1')
+
     def test_tailscale_rejects_a_bad_key_before_calling_the_client(self):
         with self.assertRaises(tailnet.TailscaleError):
             tailnet.connect('not-a-key', 'printharbor')

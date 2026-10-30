@@ -75,12 +75,16 @@ def logout(request: Request, token: str = Form(...)):
     request.session.clear()
     return RedirectResponse('/login', status_code=303)
 
-@app.get('/', response_class=HTMLResponse)
-def index(request: Request, page: str = 'overview'):
-    require_auth(request)
+def render_page(request, page='overview', notice='', error='', config=None, folders=None):
     if page not in ('overview', 'printers', 'jobs', 'email', 'tailscale'):
         page = 'overview'
-    cfg = store.settings()
+    cfg = dict(config or store.settings())
+    current = (cfg.get('imap_folder') or 'INBOX').strip() or 'INBOX'
+    cfg['imap_folder'] = current
+    shown = []
+    for name in [current, *(folders or [])]:
+        if name and name not in shown:
+            shown.append(name)
     printers = store.records('printers')
     if page in ('overview', 'printers'):
         for printer in printers:
@@ -98,6 +102,7 @@ def index(request: Request, page: str = 'overview'):
         'name': request.session.get('username'),
         'token': request.session['csrf'],
         'config': cfg,
+        'folders': shown,
         'printers': printers,
         'jobs': jobs,
         'counts': counts,
@@ -106,9 +111,18 @@ def index(request: Request, page: str = 'overview'):
         'tail': tailnet.status(),
         'active_jobs': printing.active_jobs() if page == 'jobs' else EMPTY_CUPS,
         'cups_report': printing.cups_printers() if page == 'printers' else EMPTY_CUPS,
-        'notice': request.query_params.get('notice', ''),
-        'error': request.query_params.get('error', ''),
+        'notice': notice,
+        'error': error,
     })
+
+@app.get('/', response_class=HTMLResponse)
+def index(request: Request, page: str = 'overview'):
+    require_auth(request)
+    return render_page(
+        request, page,
+        request.query_params.get('notice', ''),
+        request.query_params.get('error', ''),
+    )
 
 @app.post('/printers/add')
 def add_printer(request: Request, token: str = Form(...), label: str = Form(...), queue: str = Form(...), host: str = Form(...), protocol: str = Form('ipp')):
@@ -170,6 +184,48 @@ def cancel_job(request: Request, token: str = Form(...), cups_id: str = Form(...
     except Exception as exc:
         return nextpage('jobs', error=str(exc))
 
+EMAIL_RE = re.compile(r'^[^@\s]+@[^@\s]+\.[^@\s]+$')
+
+def mail_values(
+    mail_enabled, imap_host, imap_port, imap_user, imap_folder, allowed_senders, mail_recipient,
+    default_queue, default_sides, print_email_body, poll_seconds, max_pages, max_mb, max_files,
+    reply_enabled, smtp_from, smtp_host, smtp_port,
+):
+    folder = imap_folder.strip()
+    sender = smtp_from.strip()
+    host = imap_host.strip()
+    smtp = smtp_host.strip() or 'smtp.gmail.com'
+    if not (1 <= imap_port <= 65535 and 1 <= smtp_port <= 65535 and 20 <= poll_seconds <= 3600 and 1 <= max_pages <= 200 and 1 <= max_mb <= 30 and 1 <= max_files <= 10):
+        raise printing.PrintError('Invalid configuration limits')
+    if default_sides.strip() not in printing.SIDES:
+        raise printing.PrintError('Invalid duplex option')
+    if not host:
+        raise printing.PrintError('IMAP server is required')
+    if not folder or len(folder) > 200 or any(ch in folder for ch in '\r\n\x00'):
+        raise printing.PrintError('Choose a mailbox folder')
+    if sender and not EMAIL_RE.fullmatch(sender):
+        raise printing.PrintError('From address must be an email address')
+    return {
+        'mail_enabled': '1' if mail_enabled == '1' else '0',
+        'imap_host': host,
+        'imap_port': str(imap_port),
+        'imap_user': imap_user.strip(),
+        'imap_folder': folder,
+        'allowed_senders': allowed_senders.strip(),
+        'mail_recipient': mail_recipient.strip(),
+        'default_queue': default_queue.strip(),
+        'default_sides': default_sides.strip(),
+        'print_email_body': '1' if print_email_body == '1' else '0',
+        'poll_seconds': str(poll_seconds),
+        'max_pages': str(max_pages),
+        'max_mb': str(max_mb),
+        'max_files': str(max_files),
+        'reply_enabled': '1' if reply_enabled == '1' else '0',
+        'smtp_from': sender,
+        'smtp_host': smtp,
+        'smtp_port': str(smtp_port),
+    }
+
 @app.post('/settings/save')
 def save_settings(
     request: Request, token: str = Form(...), mail_enabled: str = Form('0'),
@@ -178,47 +234,26 @@ def save_settings(
     mail_recipient: str = Form(''), default_queue: str = Form(''), default_sides: str = Form('one-sided'),
     print_email_body: str = Form('0'), poll_seconds: int = Form(60), max_pages: int = Form(40),
     max_mb: int = Form(12), max_files: int = Form(5), new_pin: str = Form(''),
+    reply_enabled: str = Form('0'), smtp_from: str = Form(''), smtp_host: str = Form('smtp.gmail.com'),
+    smtp_port: int = Form(587),
 ):
     csrf(request, token)
-    enabled = '1' if mail_enabled == '1' else '0'
-    print_body = '1' if print_email_body == '1' else '0'
-    host = imap_host.strip()
-    user = imap_user.strip()
-    folder = imap_folder.strip() or 'INBOX'
-    senders = allowed_senders.strip()
-    recipient = mail_recipient.strip()
-    queue = default_queue.strip()
-    sides = default_sides.strip()
     password = ''.join(imap_password.split())
     pin = new_pin.strip()
-    if not (1 <= imap_port <= 65535 and 20 <= poll_seconds <= 3600 and 1 <= max_pages <= 200 and 1 <= max_mb <= 30 and 1 <= max_files <= 10):
-        return nextpage('email', error='Invalid configuration limits')
-    if sides not in printing.SIDES:
-        return nextpage('email', error='Invalid duplex option')
+    try:
+        values = mail_values(
+            mail_enabled, imap_host, imap_port, imap_user, imap_folder, allowed_senders, mail_recipient,
+            default_queue, default_sides, print_email_body, poll_seconds, max_pages, max_mb, max_files,
+            reply_enabled, smtp_from, smtp_host, smtp_port,
+        )
+    except printing.PrintError as exc:
+        return nextpage('email', error=str(exc))
     if pin and not re.fullmatch(r'[A-Za-z0-9]{6,32}', pin):
         return nextpage('email', error='PIN must be 6 to 32 letters or digits')
-    if not host:
-        return nextpage('email', error='IMAP server is required')
-    if queue:
+    if values['default_queue']:
         with store.connection() as db:
-            if not db.execute('SELECT 1 FROM printers WHERE queue=?', (queue,)).fetchone():
+            if not db.execute('SELECT 1 FROM printers WHERE queue=?', (values['default_queue'],)).fetchone():
                 return nextpage('email', error='Choose a configured printer')
-    values = {
-        'mail_enabled': enabled,
-        'imap_host': host,
-        'imap_port': str(imap_port),
-        'imap_user': user,
-        'imap_folder': folder,
-        'allowed_senders': senders,
-        'mail_recipient': recipient,
-        'default_queue': queue,
-        'default_sides': sides,
-        'print_email_body': print_body,
-        'poll_seconds': str(poll_seconds),
-        'max_pages': str(max_pages),
-        'max_mb': str(max_mb),
-        'max_files': str(max_files),
-    }
     with store.connection() as db:
         for key, value in values.items():
             store.set_setting(key, value, db=db)
@@ -228,6 +263,42 @@ def save_settings(
             store.set_setting('email_pin', pin, db=db)
     store.event('info', 'Email printing settings updated')
     return nextpage('email', 'Settings saved')
+
+@app.post('/mail/folders', response_class=HTMLResponse)
+def mail_folders(
+    request: Request, token: str = Form(...), mail_enabled: str = Form('0'),
+    imap_host: str = Form('imap.gmail.com'), imap_port: int = Form(993), imap_user: str = Form(''),
+    imap_password: str = Form(''), imap_folder: str = Form('INBOX'), allowed_senders: str = Form(''),
+    mail_recipient: str = Form(''), default_queue: str = Form(''), default_sides: str = Form('one-sided'),
+    print_email_body: str = Form('0'), poll_seconds: int = Form(60), max_pages: int = Form(40),
+    max_mb: int = Form(12), max_files: int = Form(5), new_pin: str = Form(''),
+    reply_enabled: str = Form('0'), smtp_from: str = Form(''), smtp_host: str = Form('smtp.gmail.com'),
+    smtp_port: int = Form(587),
+):
+    csrf(request, token)
+    saved = store.settings()
+    typed = ''.join(imap_password.split())
+    secret = typed or saved.get('imap_password') or ''
+    try:
+        values = mail_values(
+            mail_enabled, imap_host, imap_port, imap_user, imap_folder, allowed_senders, mail_recipient,
+            default_queue, default_sides, print_email_body, poll_seconds, max_pages, max_mb, max_files,
+            reply_enabled, smtp_from, smtp_host, smtp_port,
+        )
+    except printing.PrintError as exc:
+        return nextpage('email', error=str(exc))
+    shown = dict(saved)
+    shown.update(values)
+    shown['imap_password'] = saved.get('imap_password') or ''
+    shown['email_pin'] = saved.get('email_pin') or ''
+    if not secret or not values['imap_user']:
+        return render_page(request, 'email', error='Enter the mailbox address and app password before loading folders', config=shown)
+    try:
+        names = mailer.list_folders(values['imap_host'], values['imap_port'], values['imap_user'], secret)
+    except Exception as exc:
+        text = str(exc).replace(secret, '')[:180]
+        return render_page(request, 'email', error=text or 'Could not list mailbox folders', config=shown)
+    return render_page(request, 'email', notice='Folders loaded', config=shown, folders=names)
 
 @app.post('/tailscale/up')
 def tailscale_up(request: Request, token: str = Form(...), auth_key: str = Form(...), hostname: str = Form('printharbor')):

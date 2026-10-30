@@ -1,10 +1,13 @@
+import base64
 import email
 import imaplib
 import re
 import secrets
+import smtplib
 import threading
 import time
 from email import policy
+from email.message import EmailMessage
 from email.utils import parseaddr, getaddresses
 from pathlib import Path
 from . import printing, store
@@ -55,7 +58,9 @@ def allowed_message(msg, config):
     sender = parseaddr(msg.get('From', ''))[1].strip().lower()
     allow = {v.strip().lower() for v in config.get('allowed_senders', '').replace(';', ',').split(',') if v.strip()}
     recipient = config.get('mail_recipient', '').strip().lower()
-    if not sender or sender not in allow or not allow:
+    if not sender:
+        return False, 'Sender address is missing', None, sender
+    if allow and sender not in allow:
         return False, 'Sender is not allowlisted', None, sender
     if recipient and recipient not in _addresses(','.join(str(v) for v in (msg.get('To'), msg.get('Cc')) if v)):
         return False, 'Recipient does not match mailbox address', None, sender
@@ -73,7 +78,7 @@ def handle_message(msg, job_prefix, config):
     ok, reason, options, sender = allowed_message(msg, config)
     if not ok:
         store.event('warning', f'Email rejected: {reason}')
-        return {'accepted': False, 'jobs': 0, 'errors': 0}
+        return {'accepted': False, 'jobs': 0, 'errors': 0, 'reason': reason, 'queue': config.get('default_queue', ''), 'notes': []}
     queue = config.get('default_queue', '')
     max_files = max(1, min(int(config.get('max_files', '5')), 10))
     parts = []
@@ -94,9 +99,11 @@ def handle_message(msg, job_prefix, config):
             if text.strip():
                 parts = [('email.txt', text.encode('utf-8'))]
     if not parts:
-        store.event('warning', 'Email contained no supported attachments')
-        return {'accepted': True, 'jobs': 0, 'errors': 1}
+        reason = 'Email contained no supported attachments'
+        store.event('warning', reason)
+        return {'accepted': True, 'jobs': 0, 'errors': 1, 'reason': reason, 'queue': queue, 'notes': [reason]}
     success = fail = 0
+    notes = []
     for i, (name, data) in enumerate(parts[:max_files]):
         try:
             printing.submit_file(
@@ -104,23 +111,146 @@ def handle_message(msg, job_prefix, config):
                 dedupe=f'{job_prefix}:{i}', **options,
             )
             success += 1
+            notes.append(f'{name} accepted by CUPS for {queue}')
         except Exception as exc:
             store.event('error', f'Email attachment {name[:90]}: {str(exc)[:230]}')
+            notes.append(f'{name}: {str(exc)[:180]}')
             fail += 1
-    return {'accepted': True, 'jobs': success, 'errors': fail}
+    return {'accepted': True, 'jobs': success, 'errors': fail, 'reason': '', 'queue': queue, 'notes': notes}
+
+def result_text(result):
+    queue = result.get('queue') or 'the default printer'
+    notes = [line for line in result.get('notes') or [] if line]
+    if not result.get('accepted'):
+        reason = result.get('reason') or 'It could not be printed.'
+        return 'PrintHarbor rejected this message.\n\n' + reason
+    jobs = result.get('jobs') or 0
+    errors = result.get('errors') or 0
+    if jobs and not errors:
+        head = f'PrintHarbor accepted {jobs} file(s) for {queue}.'
+    elif jobs:
+        head = f'PrintHarbor accepted {jobs} file(s) for {queue}. {errors} file(s) failed.'
+    else:
+        head = 'PrintHarbor could not print this message.'
+    if notes:
+        return head + '\n\n' + '\n'.join(notes)
+    return head
+
+def notify_sender(original, config, result):
+    if config.get('reply_enabled') != '1':
+        return
+    recipient = parseaddr(original.get('From', ''))[1].strip()
+    login = (config.get('imap_user') or '').strip()
+    sender = (config.get('smtp_from') or login).strip()
+    password = config.get('imap_password') or ''
+    if not recipient or not sender or not login or not password:
+        return
+    reply = EmailMessage()
+    reply['From'] = sender
+    reply['To'] = recipient
+    subject = str(original.get('Subject') or 'Print job')
+    reply['Subject'] = subject if subject.lower().startswith('re:') else 'Re: ' + subject
+    message_id = original.get('Message-ID')
+    if message_id:
+        reply['In-Reply-To'] = message_id
+        reply['References'] = message_id
+    reply.set_content(result_text(result))
+    host = (config.get('smtp_host') or 'smtp.gmail.com').strip()
+    port = int(config.get('smtp_port') or '587')
+    if port == 465:
+        client = smtplib.SMTP_SSL(host, port, timeout=20)
+    else:
+        client = smtplib.SMTP(host, port, timeout=20)
+        client.ehlo()
+        client.starttls()
+        client.ehlo()
+    try:
+        client.login(login, password)
+        client.send_message(reply)
+    finally:
+        try:
+            client.quit()
+        except Exception:
+            pass
+
+def decode_imap_utf7(text):
+    if text is None:
+        return ''
+    if isinstance(text, bytes):
+        text = text.decode('ascii', 'replace')
+    out = []
+    i = 0
+    while i < len(text):
+        if text[i] != '&':
+            out.append(text[i])
+            i += 1
+            continue
+        end = text.find('-', i)
+        if end == -1:
+            out.append(text[i:])
+            break
+        token = text[i + 1:end]
+        if token == '':
+            out.append('&')
+        else:
+            padded = token.replace(',', '/')
+            padded += '=' * ((4 - len(padded) % 4) % 4)
+            out.append(base64.b64decode(padded).decode('utf-16-be'))
+        i = end + 1
+    return ''.join(out)
+
+def mailbox_name(line):
+    if isinstance(line, bytes):
+        line = line.decode('latin-1', 'replace')
+    if line.startswith('('):
+        end = line.find(')')
+        if end != -1:
+            line = line[end + 1:].strip()
+    if line[:3].upper() == 'NIL':
+        line = line[3:].strip()
+    elif line.startswith('"'):
+        end = line.find('"', 1)
+        line = line[end + 1:].strip() if end != -1 else line[1:]
+    line = line.strip()
+    if len(line) >= 2 and line.startswith('"') and line.endswith('"'):
+        line = line[1:-1].replace('\\"', '"').replace('\\\\', '\\')
+    return decode_imap_utf7(line)
+
+def list_folders(host, port, user, password):
+    conn = imaplib.IMAP4_SSL(host, int(port), timeout=18)
+    try:
+        conn.login(user, password)
+        status, data = conn.list()
+        if status != 'OK':
+            raise RuntimeError('Could not list mailbox folders')
+        names = []
+        for item in data or []:
+            if not item:
+                continue
+            name = mailbox_name(item)
+            if name and name not in names:
+                names.append(name)
+        if not names:
+            raise RuntimeError('The mailbox returned no folders')
+        return names
+    finally:
+        try:
+            conn.logout()
+        except Exception:
+            pass
 
 def check_once():
     conn = None
     try:
         config = store.settings()
         if config.get('mail_enabled') != '1':
-            publish(state='Disabled', detail='Enable mail intake in Settings')
+            publish(state='Disabled', detail='Turn on automatic email printing below, then save.')
             return
         if not all([
             config.get('imap_host'), config.get('imap_user'), config.get('imap_password'),
-            config.get('default_queue'), config.get('allowed_senders'),
+            config.get('default_queue'),
         ]):
-            publish(state='Needs setup', detail='Mailbox, sender allowlist, and printer queue are required')
+            publish(state='Needs setup', detail='Mailbox login and a default printer are required')
             return
         folder = config.get('imap_folder') or 'INBOX'
         conn = imaplib.IMAP4_SSL(config['imap_host'], int(config.get('imap_port', '993')), timeout=18)
@@ -151,14 +281,25 @@ def check_once():
             result = handle_message(msg, key, config)
             if (not result['accepted']) or result['errors']:
                 problems += 1
+            try:
+                notify_sender(msg, config, result)
+            except Exception as exc:
+                secret = config.get('imap_password') or ''
+                store.event('error', 'Result email failed: ' + str(exc).replace(secret, '')[:300])
             # Mark handled mail as seen, including rejects. Print errors stay in Jobs for retry.
             conn.uid('store', uid, '+FLAGS', '(\\Seen)')
             count += 1
         state, detail = summarize_poll(count, problems)
         publish(state=state, detail=detail)
     except Exception as exc:
-        publish(state='Error', detail=str(exc)[:170])
-        store.event('error', 'Mail check failed: ' + str(exc)[:300])
+        secret = ''
+        try:
+            secret = store.settings().get('imap_password') or ''
+        except Exception:
+            secret = ''
+        detail = str(exc).replace(secret, '') if secret else str(exc)
+        publish(state='Error', detail=detail[:170])
+        store.event('error', 'Mail check failed: ' + detail[:300])
     finally:
         publish(checked=time.strftime('%Y-%m-%d %H:%M:%S'))
         if conn:

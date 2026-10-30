@@ -18,6 +18,7 @@ DEFAULTS = {
     'mail_recipient': '', 'poll_seconds': os.getenv('POLL_SECONDS', '60'),
     'default_queue': '', 'default_sides': 'one-sided', 'max_pages': '40',
     'max_files': '5', 'max_mb': '12', 'print_email_body': '0',
+    'reply_enabled': '0', 'smtp_from': '', 'smtp_host': 'smtp.gmail.com', 'smtp_port': '587',
 }
 
 def _key():
