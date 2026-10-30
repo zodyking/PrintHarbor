@@ -84,12 +84,17 @@ def allowed_message(msg, config):
         command['sides'] = fallback if fallback in printing.SIDES else 'one-sided'
     return True, '', command, sender
 
+def message_label(msg):
+    subject = ' '.join(str(msg.get('Subject') or '').split())
+    return subject[:180] or 'Email'
+
 def handle_message(msg, job_prefix, config):
     ok, reason, options, sender = allowed_message(msg, config)
-    if not ok:
-        store.event('warning', f'Email rejected: {reason}')
-        return {'accepted': False, 'jobs': 0, 'errors': 0, 'reason': reason, 'queue': config.get('default_queue', ''), 'notes': []}
     queue = config.get('default_queue', '')
+    if not ok:
+        printing.record_rejection(message_label(msg), reason, queue, 'email', sender, job_prefix)
+        store.event('warning', f'Email rejected: {reason}')
+        return {'accepted': False, 'jobs': 0, 'errors': 0, 'reason': reason, 'queue': queue, 'notes': []}
     max_files = max(1, min(int(config.get('max_files', '5')), 10))
     parts = []
     for part in msg.walk():
@@ -110,6 +115,7 @@ def handle_message(msg, job_prefix, config):
                 parts = [('email.txt', text.encode('utf-8'))]
     if not parts:
         reason = 'Email contained no supported attachments'
+        printing.record_rejection(message_label(msg), reason, queue, 'email', sender, job_prefix, options.get('copies', 1), options.get('sides', 'one-sided'))
         store.event('warning', reason)
         return {'accepted': True, 'jobs': 0, 'errors': 1, 'reason': reason, 'queue': queue, 'notes': [reason]}
     success = fail = 0

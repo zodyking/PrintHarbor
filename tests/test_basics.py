@@ -78,6 +78,42 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(out2['jobs'],1)
             self.assertEqual(fake.call_count,1)  # duplicate never re-submitted
 
+    def test_rejected_mail_is_listed_with_the_reason(self):
+        msg=EmailMessage()
+        msg['From']='Stranger <stranger@example.com>'
+        msg['To']='print@example.com'
+        msg['Subject']='Please print this'
+        cfg={'allowed_senders':'trusted@example.com','mail_recipient':'','email_pin':'','default_sides':'one-sided','default_queue':'Office','max_files':'5','print_email_body':'0'}
+        first=mailer.handle_message(msg,'reject-uid-1',cfg)
+        self.assertFalse(first['accepted'])
+        mailer.handle_message(msg,'reject-uid-1',cfg)
+        empty=EmailMessage()
+        empty['From']='person@example.com'
+        empty['Subject']='PRINT DUPLEX'
+        empty.set_content('body only')
+        open_cfg=dict(cfg, allowed_senders='', email_pin='')
+        second=mailer.handle_message(empty,'reject-uid-2',open_cfg)
+        self.assertEqual(second['reason'],'Email contained no supported attachments')
+        with store.connection() as db:
+            rows=db.execute("SELECT dedupe,status,error,filename,sender FROM jobs WHERE dedupe IN ('reject-uid-1','reject-uid-2') ORDER BY dedupe").fetchall()
+        self.assertEqual(len(rows),2)
+        self.assertEqual(rows[0]['status'],'rejected')
+        self.assertEqual(rows[0]['filename'],'Please print this')
+        self.assertEqual(rows[0]['sender'],'stranger@example.com')
+        self.assertIn('allowlisted', rows[0]['error'])
+        self.assertEqual(rows[1]['status'],'rejected')
+        self.assertIn('no supported attachments', rows[1]['error'])
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with TestClient(app) as client:
+            client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+            page=client.get('/?page=jobs')
+            self.assertIn('Please print this', page.text)
+            self.assertIn('Sender is not allowlisted', page.text)
+            self.assertIn('Email contained no supported attachments', page.text)
+            self.assertIn('>rejected<', page.text)
+            self.assertIn('Rejected mail stays in this log', page.text)
+
     def test_queue_input_validation(self):
         with self.assertRaises(printing.PrintError):
             printing.add_printer('Bad','../evil','127.0.0.1','ipp')
