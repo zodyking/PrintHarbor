@@ -15,6 +15,10 @@ from . import mailer, printing, store, tailnet
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     store.initialize()
+    try:
+        printing.retarget_saved_queues()
+    except Exception:
+        store.event('warning', 'Saved printers could not be checked')
     mailer.STOP.clear()
     thread = threading.Thread(target=mailer.run_loop, daemon=True, name='imap-poller')
     thread.start()
@@ -86,6 +90,8 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
         if name and name not in shown:
             shown.append(name)
     printers = store.records('printers')
+    edit_name = (request.query_params.get('edit') or '').strip()
+    editing = next((item for item in printers if item['queue'] == edit_name), None)
     if page in ('overview', 'printers'):
         for printer in printers:
             printer['online'] = printing.printer_reachable(printer['host'], printer['protocol'])
@@ -104,6 +110,7 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
         'config': cfg,
         'folders': shown,
         'printers': printers,
+        'editing': editing,
         'jobs': jobs,
         'counts': counts,
         'mail': mailer.snapshot(),
@@ -125,13 +132,22 @@ def index(request: Request, page: str = 'overview'):
     )
 
 @app.post('/printers/add')
-def add_printer(request: Request, token: str = Form(...), label: str = Form(...), queue: str = Form(...), host: str = Form(...), protocol: str = Form('ipp')):
+def add_printer(request: Request, token: str = Form(...), label: str = Form(...), queue: str = Form(...), host: str = Form(...), protocol: str = Form('socket')):
     csrf(request, token)
     try:
-        printing.add_printer(label, queue, host, protocol)
+        identity = printing.add_printer(label, queue, host, protocol)
         if not store.settings().get('default_queue'):
             store.set_setting('default_queue', queue)
-        return nextpage('printers', 'Printer configured')
+        return nextpage('printers', f'Printer added: {identity}'[:180])
+    except Exception as exc:
+        return nextpage('printers', error=str(exc))
+
+@app.post('/printers/edit')
+def edit_printer(request: Request, token: str = Form(...), queue: str = Form(...), label: str = Form(...), host: str = Form(...), action: str = Form('save')):
+    csrf(request, token)
+    try:
+        identity = printing.update_printer(queue, label, host, reread=(action == 'reread'))
+        return nextpage('printers', f'Printer saved: {identity}'[:180])
     except Exception as exc:
         return nextpage('printers', error=str(exc))
 

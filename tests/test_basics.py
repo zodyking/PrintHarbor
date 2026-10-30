@@ -176,6 +176,156 @@ class CoreTests(unittest.TestCase):
         with self.assertRaises(printing.PrintError):
             printing.add_printer('Bad','../evil','127.0.0.1','ipp')
 
+    def test_driver_match_uses_identity_and_falls_back(self):
+        drivers=printing.parse_lpinfo('\n'.join([
+            '{',
+            'name = everywhere',
+            'make-and-model = IPP Everywhere',
+            'device-id =',
+            '}',
+            '{',
+            'name = drv:///sample.drv/generic.ppd',
+            'make-and-model = Generic PostScript',
+            'device-id =',
+            '}',
+            '{',
+            'name = drv:///brlaser.drv/brl2380d.ppd',
+            'make-and-model = Brother HL-L2380DW series, using brlaser v6.2.8',
+            'device-id = MFG:Brother;MDL:HL-L2380DW series;',
+            '}',
+            '{',
+            'name = gutenprint.5.3://epson/epson-et-2760',
+            'make-and-model = Epson ET-2760',
+            'device-id = MFG:Epson;MDL:ET-2760;',
+            '}',
+        ]))
+        brother=printing.choose_driver({
+            'reachable':True,'ipp':True,'socket':True,'make':'Brother',
+            'model':'HL-L2380DW series','identity':'Brother HL-L2380DW series',
+        }, drivers)
+        self.assertEqual(brother['model'],'drv:///brlaser.drv/brl2380d.ppd')
+        self.assertEqual(brother['protocol'],'socket')
+        self.assertEqual(brother['driver'],'Brother driver, darkest setting')
+        epson=printing.choose_driver({
+            'reachable':True,'ipp':False,'socket':True,'make':'Epson','model':'ET-2760','identity':'Epson ET-2760',
+        }, drivers)
+        self.assertEqual(epson['model'],'gutenprint.5.3://epson/epson-et-2760')
+        self.assertEqual(epson['protocol'],'socket')
+        described=printing.choose_driver({
+            'reachable':True,'ipp':True,'socket':False,'make':'HP','model':'OfficeJet Pro 9020','identity':'HP OfficeJet Pro 9020',
+        }, drivers)
+        self.assertEqual(described['model'],'everywhere')
+        self.assertEqual(described['protocol'],'ipp')
+        self.assertNotIn('generic.ppd', described['model'])
+        fields=printing.device_fields('MFG:Brother;CMD:PJL;MDL:HL-L2380DW series;')
+        self.assertEqual(fields['MFG'],'Brother')
+        self.assertEqual(fields['MDL'],'HL-L2380DW series')
+        payload=b'\x02\x00\x00\x00\x00\x00\x00\x01\x04'
+        payload+=bytes([0x41])+len('printer-make-and-model').to_bytes(2,'big')+b'printer-make-and-model'
+        payload+=len('Brother HL-L2380DW').to_bytes(2,'big')+b'Brother HL-L2380DW'+b'\x03'
+        parsed=printing.parse_ipp(b'HTTP/1.1 200 OK\r\n\r\n'+payload)
+        self.assertEqual(parsed['printer-make-and-model'],['Brother HL-L2380DW'])
+        listed='\n'.join([
+            'PageSize/Media Size: Letter *A4',
+            'brlaserEconomode/Toner save mode: *True False',
+            'brlaserDensityAdjust/Toner Density: 94 100 *102 106',
+            'Resolution/Resolution: 300dpi *600dpi 1200dpi',
+        ])
+        self.assertEqual(printing.density_options(listed),[
+            ('brlaserEconomode','False'),
+            ('brlaserDensityAdjust','106'),
+        ])
+        self.assertEqual(printing.density_options('PageSize/Media Size: *Letter'),[])
+
+    def test_saved_printer_is_reread_and_matched(self):
+        calls=[]
+        def fake_cmd(*args, timeout=25):
+            calls.append(args)
+            stdout=''
+            if args[0]=='lpinfo':
+                stdout='\n'.join([
+                    'drv:///brlaser.drv/brl2380d.ppd Brother HL-L2380DW series, using brlaser v6.2.8',
+                    'everywhere IPP Everywhere',
+                ])
+            elif args[:2]==('lpoptions','-p'):
+                stdout='brlaserEconomode/Toner save mode: *True False\nbrlaserDensityAdjust/Toner Density: 100 *102 106\n'
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+        discovery={
+            'reachable':True,'ipp':True,'socket':True,'make':'Brother',
+            'model':'HL-L2380DW series','identity':'Brother HL-L2380DW series','device_id':'',
+        }
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='FadeFix'")
+            db.execute("INSERT INTO printers(queue,label,host,protocol) VALUES('FadeFix','Office','192.168.1.20','ipp')")
+        with patch.object(printing,'cmd',fake_cmd), patch.object(printing,'discover_printer',lambda host: discovery):
+            printing.retarget_saved_queues()
+        self.assertIn(('lpadmin','-p','FadeFix','-E','-v','socket://192.168.1.20:9100','-m','drv:///brlaser.drv/brl2380d.ppd'),calls)
+        self.assertIn(('lpadmin','-p','FadeFix','-o','brlaserEconomode=False'),calls)
+        self.assertIn(('lpadmin','-p','FadeFix','-o','brlaserDensityAdjust=106'),calls)
+        joined=' '.join(' '.join(args) for args in calls)
+        self.assertNotIn('-m everywhere', joined)
+        with store.connection() as db:
+            row=db.execute("SELECT protocol, identity, driver FROM printers WHERE queue='FadeFix'").fetchone()
+            db.execute("DELETE FROM printers WHERE queue='FadeFix'")
+        self.assertEqual(row['protocol'],'socket')
+        self.assertEqual(row['identity'],'Brother HL-L2380DW series')
+        self.assertIn('Brother driver', row['driver'])
+
+    def test_failed_retarget_keeps_the_saved_protocol(self):
+        def fake_cmd(*args, timeout=25):
+            return SimpleNamespace(returncode=1, stdout='', stderr='driver missing')
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='Kept'")
+            db.execute("INSERT INTO printers(queue,label,host,protocol) VALUES('Kept','Kept','192.168.1.21','ipp')")
+        with patch.object(printing,'cmd',fake_cmd):
+            printing.retarget_saved_queues()
+        with store.connection() as db:
+            row=db.execute("SELECT protocol FROM printers WHERE queue='Kept'").fetchone()
+            db.execute("DELETE FROM printers WHERE queue='Kept'")
+        self.assertEqual(row['protocol'],'ipp')
+
+    def test_printer_name_changes_without_rereading(self):
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='EditMe'")
+            db.execute("INSERT INTO printers(queue,label,host,protocol,identity,driver) VALUES('EditMe','Old','192.168.1.20','socket','Brother HL-L2380DW series','Brother driver')")
+        calls=[]
+        def fake_cmd(*args, timeout=25):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout='', stderr='')
+        with patch.object(printing,'cmd',fake_cmd):
+            shown=printing.update_printer('EditMe','Front desk','192.168.1.20')
+        self.assertEqual(shown,'Brother HL-L2380DW series')
+        self.assertEqual(calls,[])
+        with store.connection() as db:
+            row=db.execute("SELECT label, host FROM printers WHERE queue='EditMe'").fetchone()
+            db.execute("DELETE FROM printers WHERE queue='EditMe'")
+        self.assertEqual(row['label'],'Front desk')
+        self.assertEqual(row['host'],'192.168.1.20')
+
+    def test_printer_address_change_selects_the_driver_again(self):
+        calls=[]
+        def fake_cmd(*args, timeout=25):
+            calls.append(args)
+            stdout=''
+            if args[0]=='lpinfo':
+                stdout='drv:///brlaser.drv/brl2380d.ppd Brother HL-L2380DW series, using brlaser v6.2.8\n'
+            elif args[:2]==('lpoptions','-p'):
+                stdout='brlaserDensityAdjust/Toner Density: 100 106\n'
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+        discovery={'reachable':True,'ipp':True,'socket':True,'make':'Brother','model':'HL-L2380DW series','identity':'Brother HL-L2380DW series','device_id':''}
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='EditMe'")
+            db.execute("INSERT INTO printers(queue,label,host,protocol,identity,driver) VALUES('EditMe','Old','192.168.1.20','ipp','','')")
+        with patch.object(printing,'cmd',fake_cmd), patch.object(printing,'discover_printer',lambda host: discovery):
+            printing.update_printer('EditMe','Front desk','192.168.1.30')
+        self.assertIn(('lpadmin','-p','EditMe','-E','-v','socket://192.168.1.30:9100','-m','drv:///brlaser.drv/brl2380d.ppd'),calls)
+        with store.connection() as db:
+            row=db.execute("SELECT label, host, protocol FROM printers WHERE queue='EditMe'").fetchone()
+            db.execute("DELETE FROM printers WHERE queue='EditMe'")
+        self.assertEqual((row['label'], row['host'], row['protocol']), ('Front desk','192.168.1.30','socket'))
+        with self.assertRaises(printing.PrintError):
+            printing.update_printer('Missing','Name','192.168.1.20')
+
     def test_dashboard_login(self):
         from fastapi.testclient import TestClient
         from app.main import app
@@ -211,6 +361,9 @@ class CoreTests(unittest.TestCase):
         from app.main import app
         with TestClient(app) as client:
             response=client.post('/printers/add',data={'token':'x','label':'A','queue':'Queue','host':'127.0.0.1','protocol':'ipp'},follow_redirects=False)
+            edit=client.post('/printers/edit',data={'token':'x','label':'A','queue':'Queue','host':'127.0.0.1','action':'save'},follow_redirects=False)
+            self.assertEqual(edit.status_code,303)
+            self.assertIn('/login',edit.headers['location'])
             self.assertEqual(response.status_code,303)
             self.assertIn('/login',response.headers['location'])
 

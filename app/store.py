@@ -65,7 +65,8 @@ def initialize():
         CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT NOT NULL);
         CREATE TABLE IF NOT EXISTS printers (
             queue TEXT PRIMARY KEY, label TEXT NOT NULL, host TEXT NOT NULL,
-            protocol TEXT NOT NULL, created_at TEXT DEFAULT CURRENT_TIMESTAMP
+            protocol TEXT NOT NULL, identity TEXT DEFAULT '', driver TEXT DEFAULT '',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS jobs (
             id INTEGER PRIMARY KEY AUTOINCREMENT, dedupe TEXT UNIQUE,
@@ -86,6 +87,11 @@ def initialize():
             db.execute('INSERT OR IGNORE INTO settings VALUES (?,?)', (k, v))
         if not db.execute("SELECT 1 FROM settings WHERE key='email_pin'").fetchone():
             set_setting('email_pin', '', db=db)
+        columns = {row['name'] for row in db.execute('PRAGMA table_info(printers)')}
+        if 'identity' not in columns:
+            db.execute("ALTER TABLE printers ADD COLUMN identity TEXT DEFAULT ''")
+        if 'driver' not in columns:
+            db.execute("ALTER TABLE printers ADD COLUMN driver TEXT DEFAULT ''")
         db.execute(
             "UPDATE jobs SET status='error', error=? WHERE status='preparing'",
             ('Interrupted before the document was submitted',),

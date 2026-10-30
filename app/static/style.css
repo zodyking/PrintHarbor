@@ -84,6 +84,8 @@ a.tail-info:hover{background:#274978}
 .footlink{margin-top:16px;color:var(--blue);font-weight:700;font-size:14px;display:inline-flex;min-height:44px;align-items:center}
 .textlink{color:var(--blue);background:none;border:0;padding:8px 10px;min-height:44px;font-weight:700;font-size:14px;display:inline-flex;align-items:center}
 .text-danger{color:#8d2f3b;background:none;border:0;font-size:14px;font-weight:700;min-height:44px;padding:8px 10px;display:inline-flex;align-items:center}
+.text-button{color:var(--blue);background:none;border:0;font-size:14px;font-weight:700;min-height:44px;padding:8px 10px;display:inline-flex;align-items:center;text-decoration:none}
+.printer-actions{display:flex;align-items:center;flex-shrink:0}
 .empty{color:var(--muted);font-size:14px;padding:16px 0}
 .empty a{color:var(--blue);text-decoration:underline}
 .table-scroll{width:100%;overflow-x:auto}
