@@ -160,10 +160,51 @@ def reply_template():
         _REPLY = env.get_template('reply.html')
     return _REPLY
 
+_FRIENDLY_REASONS = {
+    'Sender address is missing': "We couldn't tell who sent this.",
+    'Sender is not allowlisted': "This email address isn't approved to print.",
+    'Recipient does not match mailbox address': 'Send it to the address for this printer.',
+    'Missing or incorrect PIN in email subject': "The code in the subject line didn't match.",
+    'Copies must be from 1 to 10': 'Ask for 1 to 10 copies.',
+    'Email contained no supported attachments': 'Attach a PDF, photo, or Office document.',
+    'It could not be printed.': "We couldn't print this.",
+    'Printer not configured': "This printer isn't available right now.",
+    'Empty attachment': 'The file was empty.',
+    'Invalid PDF file': "That PDF couldn't be opened.",
+    'Invalid print options': "Those print options aren't available.",
+}
+
+def customer_line(text):
+    raw = ' '.join(str(text or '').split())
+    if raw in _FRIENDLY_REASONS:
+        return _FRIENDLY_REASONS[raw]
+    if raw.lower().startswith('accepted for ') or 'accepted by cups' in raw.lower():
+        return 'Printed'
+    lowered = raw.lower()
+    if raw.startswith('File larger than'):
+        return 'This file is over the size limit.'
+    if raw.startswith('Unsupported file type') or 'no supported' in lowered:
+        return "That file type can't be printed. Send a PDF, photo, or Office document."
+    if raw.startswith('Document has') and 'page' in lowered:
+        return raw.replace('Document has', 'This document has').replace('; limit is', '. The limit is')
+    if any(word in lowered for word in (
+        'cups', 'lpadmin', 'lpstat', 'imap', 'smtp', 'libreoffice', 'soffice',
+        'traceback', 'uidvalidity', 'not installed', 'not on path', 'timed out',
+        'office conversion', 'already processed',
+    )):
+        return "The printer couldn't take this file. Send it again."
+    return raw
+
+def printer_name(queue):
+    name = (queue or '').replace('_', ' ').strip()
+    if not name or name == '—':
+        return 'your printer'
+    return name
+
 def _file_row(name, description):
     clean = str(name or 'File')
     ext = Path(clean).suffix.replace('.', '').upper()[:4] or 'FILE'
-    return {'extension': ext, 'name': clean, 'description': str(description or '')}
+    return {'extension': ext, 'name': clean, 'description': customer_line(description)}
 
 def _file_rows(result):
     rows = [_file_row(item.get('name'), item.get('detail')) for item in result.get('files') or []]
@@ -173,18 +214,15 @@ def _file_rows(result):
         text = str(line or '').strip()
         if not text:
             continue
-        if ' accepted by CUPS for ' in text:
-            name, _, target = text.partition(' accepted by CUPS for ')
-            rows.append(_file_row(name, f'Accepted for {target}'))
+        if ' accepted by CUPS for ' in text or ' accepted by cups for ' in text.lower():
+            name = re.split(r' accepted by CUPS for ', text, flags=re.I)[0]
+            rows.append(_file_row(name, 'Printed'))
         elif ': ' in text:
             name, _, detail = text.partition(': ')
             rows.append(_file_row(name, detail))
         else:
-            rows.append({'extension': 'MSG', 'name': 'This message', 'description': text})
-    if rows:
-        return rows
-    reason = result.get('reason') or 'Nothing in this message was sent to the printer.'
-    return [{'extension': 'MSG', 'name': 'This message', 'description': reason}]
+            rows.append({'extension': 'MSG', 'name': 'This message', 'description': customer_line(text)})
+    return [row for row in rows if row['name'] != 'This message']
 
 def _settings_line(result):
     copies = result.get('copies')
@@ -199,62 +237,53 @@ def _settings_line(result):
     layout = SIDE_LABELS.get(sides or '', sides or 'Single-sided')
     return f'{count} {copy_word} · {layout}'
 
+def _files_are(count):
+    if count == 1:
+        return 'Your file is'
+    return f'Your {count} files are'
+
 def reply_context(result):
-    queue = (result.get('queue') or '').strip()
-    printer = queue if queue and queue != '—' else ''
+    printer = printer_name(result.get('queue'))
+    named = printer != 'your printer'
     jobs = result.get('jobs') or 0
     errors = result.get('errors') or 0
-    reason = result.get('reason') or 'It could not be printed.'
-    if not result.get('accepted'):
+    reason = customer_line(result.get('reason') or "We couldn't print this.")
+    if not result.get('accepted') or not jobs:
         outcome = 'rejected'
-    elif jobs and errors:
+    elif errors:
         outcome = 'partial'
-    elif jobs:
+    else:
         outcome = 'accepted'
-    else:
-        outcome = 'rejected'
+    where = printer if named else 'the printer'
     if outcome == 'accepted':
-        eyebrow = 'PRINT REQUEST ACCEPTED'
-        hero = ('Sent to', 'the printer.')
-        intro = f'Your message was received. {jobs} file(s) were accepted for {printer or "the default printer"}.'
-        card_label = 'YOUR PRINTER'
-        card_value = printer or 'The default printer'
-        card_note = 'CUPS accepted the job. That means the printer was asked to print, not that the page is already out.'
-        preview = f'Print Harbor accepted {jobs} file(s) for {card_value}.'
-        steps = [
-            {'number': '01', 'title': 'We received it.', 'body': 'The message arrived in the folder this mailbox is watching.'},
-            {'number': '02', 'title': 'It was checked.', 'body': 'The sender, destination, and PIN rules saved for this mailbox were applied.'},
-            {'number': '03', 'title': 'It was sent.', 'body': f'{card_value} was given the file. Collect the pages from that printer.'},
-        ]
+        eyebrow = 'PRINT CONFIRMED'
+        hero = ("It's on", 'the way.')
+        intro = f'{_files_are(jobs)} on the way to {where}.'
+        card_label = 'PRINTER'
+        card_value = printer if named else 'Your printer'
+        card_note = 'Pick up your pages there.'
+        preview = f'Your print is on the way to {card_value}.'
     elif outcome == 'partial':
-        eyebrow = 'PRINT REQUEST INCOMPLETE'
-        hero = ('Some files', 'were sent.')
-        intro = f'Your message was received. {jobs} file(s) were accepted for {printer or "the default printer"}. {errors} file(s) were not.'
-        card_label = 'WHAT HAPPENED'
-        card_value = f'{jobs} sent, {errors} not printed'
-        card_note = 'The reason for each file is listed below.'
-        preview = card_value + '.'
-        steps = [
-            {'number': '01', 'title': 'We received it.', 'body': 'The message arrived in the folder this mailbox is watching.'},
-            {'number': '02', 'title': 'Some files were sent.', 'body': f'{printer or "The printer"} accepted the files marked as accepted below.'},
-            {'number': '03', 'title': 'Some were not.', 'body': 'The reason is next to each file. Send a new message for the ones that failed.'},
-        ]
+        eyebrow = 'PARTLY PRINTED'
+        hero = ('Some files', 'were printed.')
+        intro = f'{jobs} printed, {errors} not. Details are below.'
+        card_label = 'PRINTER'
+        card_value = printer if named else 'Your printer'
+        card_note = 'The files that did not print are listed below.'
+        preview = 'Some of your files were printed.'
     else:
-        eyebrow = 'PRINT REQUEST REJECTED'
+        eyebrow = 'NOT PRINTED'
         hero = ('This was', 'not printed.')
-        intro = 'Your message was received, but Print Harbor did not send it to a printer.'
-        card_label = 'WHY IT WAS REJECTED'
+        intro = "We got your message, but it didn't go to the printer."
+        card_label = 'REASON'
         card_value = reason
-        card_note = 'Correct this and send a new message. This one will not be printed.'
-        preview = f'Print Harbor did not print this message. {reason}'
-        steps = [
-            {'number': '01', 'title': 'We received it.', 'body': 'The message arrived in the folder this mailbox is watching.'},
-            {'number': '02', 'title': 'It was stopped.', 'body': reason},
-            {'number': '03', 'title': 'Send it again.', 'body': 'Fix the reason above, then send a new message to this mailbox.'},
-        ]
+        card_note = 'Fix this, then send it again.'
+        preview = f"We couldn't print this. {reason}"
+    files = _file_rows(result)
     return {
         'title': 'Print Harbor',
         'preview': preview,
+        'outcome': outcome,
         'eyebrow': eyebrow,
         'hero_line_1': hero[0],
         'hero_line_2': hero[1],
@@ -262,9 +291,9 @@ def reply_context(result):
         'card_label': card_label,
         'card_value': card_value,
         'card_note': card_note,
-        'steps': steps,
-        'files': _file_rows(result),
-        'printer': printer,
+        'files': files,
+        'show_files': bool(files),
+        'printer': printer if named else '',
         'settings_line': _settings_line(result),
     }
 
@@ -272,22 +301,17 @@ def render_reply(result):
     return reply_template().render(**reply_context(result))
 
 def result_text(result):
-    queue = result.get('queue') or 'the default printer'
-    notes = [line for line in result.get('notes') or [] if line]
-    if not result.get('accepted'):
-        reason = result.get('reason') or 'It could not be printed.'
-        return 'PrintHarbor rejected this message.\n\n' + reason
-    jobs = result.get('jobs') or 0
-    errors = result.get('errors') or 0
-    if jobs and not errors:
-        head = f'PrintHarbor accepted {jobs} file(s) for {queue}.'
-    elif jobs:
-        head = f'PrintHarbor accepted {jobs} file(s) for {queue}. {errors} file(s) failed.'
-    else:
-        head = 'PrintHarbor could not print this message.'
-    if notes:
-        return head + '\n\n' + '\n'.join(notes)
-    return head
+    ctx = reply_context(result)
+    lines = [f"{ctx['hero_line_1']} {ctx['hero_line_2']}", '', ctx['intro']]
+    if ctx['outcome'] == 'rejected':
+        lines += ['', ctx['card_value']]
+    elif ctx['printer']:
+        lines += ['', f"Printer: {ctx['printer']}"]
+    for item in ctx['files']:
+        lines.append(f"{item['name']} — {item['description']}")
+    if ctx['settings_line']:
+        lines += ['', ctx['settings_line']]
+    return '\n'.join(lines)
 
 def notify_sender(original, config, result):
     if config.get('reply_enabled') != '1':
