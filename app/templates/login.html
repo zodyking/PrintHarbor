@@ -4,12 +4,14 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · Sign in</title>
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body class="login-shell">
   <main class="login-card">
-    <div class="brand-logo" aria-hidden="true">P<span>H</span></div>
-    <div class="eyebrow">Print operations</div>
+    <div class="login-lockup">
+      <div class="brand-logo" aria-hidden="true">PH</div>
+      <strong>Print Harbor<span>.</span></strong>
+    </div>
     <h1>Sign in</h1>
     <p class="muted">Manage printers, jobs, and email intake.</p>
     {% if error %}<div class="alert bad" role="alert">{{ error }}</div>{% endif %}
@@ -18,7 +20,7 @@
       <label>Password<input name="password" type="password" required autocomplete="current-password"></label>
       <button class="button full" type="submit">Sign in <span aria-hidden="true">→</span></button>
     </form>
-    <p class="tiny center">Session stays on this PrintHarbor host.</p>
+    <p class="tiny">Session stays on this PrintHarbor host.</p>
   </main>
 </body>
 </html>
