@@ -27,6 +27,9 @@ class CoreTests(unittest.TestCase):
                          'two-sided-short-edge')
         self.assertIsNone(mailer.parse_command('PRINT DUPLEX','abcdef12'))
         self.assertIsNone(mailer.parse_command('PRINT PIN:abcDEF12 COPIES=99','abcdef12'))
+        self.assertEqual(mailer.parse_command('PRINT DUPLEX COPIES=2',''),
+                         {'sides':'two-sided-long-edge','copies':2})
+        self.assertIsNone(mailer.parse_command('COPIES=99',''))
 
     def test_sender_and_pin(self):
         msg=EmailMessage()
@@ -154,7 +157,7 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(kept.status_code,303)
             cfg=store.settings()
             self.assertEqual(cfg['imap_password'],'abcdefghijkl')
-            self.assertEqual(cfg['email_pin'],'abc12345')
+            self.assertEqual(cfg['email_pin'],'')
             self.assertEqual(cfg['poll_seconds'],'90')
             self.assertEqual(cfg['mail_enabled'],'0')
 
@@ -237,7 +240,8 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(command['sides'],'two-sided-long-edge')
         cfg['default_sides']='nope'
         self.assertEqual(mailer.allowed_message(msg,cfg)[2]['sides'],'one-sided')
-        self.assertEqual(mailer.summarize_poll(0,0)[0],'Healthy')
+        self.assertEqual(mailer.summarize_poll(0,0)[0],'Watching')
+        self.assertEqual(mailer.summarize_poll(1,0)[0],'Healthy')
         self.assertEqual(mailer.summarize_poll(2,1)[0],'Attention')
 
     def test_blank_allowlist_accepts_any_sender(self):
@@ -254,6 +258,14 @@ class CoreTests(unittest.TestCase):
         self.assertTrue(mailer.allowed_message(msg, closed)[0])
         msg.replace_header('To','other@example.com')
         self.assertFalse(mailer.allowed_message(msg, closed)[0])
+        open_mail=EmailMessage()
+        open_mail['From']='person@example.com'
+        open_mail['To']='other@example.com'
+        open_mail['Subject']='Please PRINT DUPLEX'
+        open_cfg={'allowed_senders':'','mail_recipient':'','email_pin':'','default_sides':'one-sided'}
+        ok, reason, command, _=mailer.allowed_message(open_mail, open_cfg)
+        self.assertTrue(ok, reason)
+        self.assertEqual(command, {'sides':'two-sided-long-edge','copies':1})
 
     def test_disabled_badge_points_at_this_page(self):
         store.set_setting('mail_enabled','0')
@@ -267,6 +279,9 @@ class CoreTests(unittest.TestCase):
             self.assertIn('Turn on automatic email printing below, then save.', page.text)
             self.assertIn('Enable automatic email printing', page.text)
             self.assertIn('Leave blank to accept mail from any sender', page.text)
+            self.assertIn('Leave blank to accept any To or Cc', page.text)
+            self.assertIn('Leave blank to require no PIN', page.text)
+            self.assertIn('Mail already in the folder is left alone', page.text)
             self.assertLess(page.text.find('Enable automatic email printing'), page.text.find('IMAP server'))
 
     def test_folder_decoding_and_list_does_not_save(self):
@@ -391,5 +406,52 @@ class CoreTests(unittest.TestCase):
             bad = client.post('/tailscale/up', data={'token': token, 'auth_key': 'not-a-key', 'hostname': 'printharbor'}, follow_redirects=False)
             self.assertIn('error=', bad.headers['location'])
             self.assertNotIn('not-a-key', bad.headers['location'])
+
+    def test_folder_watch_ignores_mail_already_present(self):
+        self.assertEqual(mailer.uids_after(b'4 5 9', 5), [b'9'])
+        self.assertEqual(mailer.uids_after(b'', 0), [])
+        self.assertEqual(mailer.parse_status(b'INBOX (UIDNEXT 12 UIDVALIDITY 4)'), (4, 12))
+        self.assertEqual(mailer.fallback_wait({'poll_seconds': '60'}), 5)
+        self.assertEqual(mailer.fallback_wait({'poll_seconds': '2'}), 2)
+        cfg={'imap_host':'imap.gmail.com','imap_user':'print@example.com','imap_folder':'Print'}
+        last, primed=mailer.adopt_cursor(cfg, 4, 12)
+        self.assertTrue(primed)
+        self.assertEqual(last, 11)
+        saved=store.settings()
+        again=dict(cfg, mail_watch=saved['mail_watch'], mail_uidvalidity=saved['mail_uidvalidity'], mail_last_uid=saved['mail_last_uid'])
+        last, primed=mailer.adopt_cursor(again, 4, 20)
+        self.assertFalse(primed)
+        self.assertEqual(last, 11)
+        last, primed=mailer.adopt_cursor(again, 9, 3)
+        self.assertTrue(primed)
+        self.assertEqual(last, 2)
+
+    def test_idle_returns_when_the_folder_changes(self):
+        lines=[b'+ idling\r\n', b'* 3 EXISTS\r\n', b'T1 OK IDLE terminated\r\n']
+
+        class Sock:
+            def settimeout(self, value):
+                pass
+
+        class Stub:
+            def __init__(self):
+                self.sock=Sock()
+                self.sent=[]
+            def _new_tag(self):
+                return b'T1'
+            def send(self, data):
+                self.sent.append(data)
+            def readline(self):
+                return lines.pop(0)
+
+        conn=Stub()
+        mailer.STOP.clear()
+        try:
+            with patch('app.mailer.select.select', return_value=([True], [], [])):
+                self.assertTrue(mailer.wait_for_new_mail(conn, seconds=5))
+        finally:
+            mailer.STOP.set()
+        self.assertTrue(any(item.endswith(b'IDLE\r\n') for item in conn.sent))
+        self.assertIn(b'DONE\r\n', conn.sent)
 
 if __name__=='__main__': unittest.main()

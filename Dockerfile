@@ -14,7 +14,9 @@ COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt
 COPY app ./app
 COPY start.sh ./start.sh
-RUN chmod +x start.sh && mkdir -p /data/files /data/tmp /run/cups && chmod 700 /data
+RUN chmod +x start.sh && mkdir -p /data/files /data/tmp /run/cups /usr/share/printharbor/cups-seed \
+  && cp -a /etc/cups/. /usr/share/printharbor/cups-seed/ \
+  && chmod 700 /data
 EXPOSE 47831
 ENTRYPOINT ["/usr/bin/tini", "--"]
 CMD ["/opt/printharbor/start.sh"]

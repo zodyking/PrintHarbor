@@ -1,6 +1,6 @@
 {% set labels = {'overview':'Overview','printers':'Printers','jobs':'Print jobs','email':'Email automation','tailscale':'Tailscale'} %}
 {% set side_labels = {'one-sided':'Single-sided','two-sided-long-edge':'Long-edge duplex','two-sided-short-edge':'Short-edge duplex'} %}
-{% set tone = 'good' if mail.state=='Healthy' else ('bad' if mail.state=='Error' else 'warn') %}
+{% set tone = 'good' if mail.state=='Healthy' or mail.state=='Watching' else ('bad' if mail.state=='Error' else 'warn') %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -200,14 +200,14 @@
       </section>
     {% elif page=='email' %}
       <div class="headerline">
-        <div><div class="eyebrow">Intake</div><h1>Email automation</h1><p class="muted">Mail with the subject PIN prints to the default queue.</p></div>
+        <div><div class="eyebrow">Intake</div><h1>Email automation</h1><p class="muted">New mail in the selected folder prints to the default queue.</p></div>
         <div class="mail-health is-{{ tone }}"><span class="green-dot {% if tone=='bad' %}is-bad{% elif tone!='good' %}is-warn{% endif %}"></span><div><strong>{{ mail.state }}</strong><small>{{ mail.detail or mail.checked or 'Not checked yet' }}</small></div></div>
       </div>
       <section class="panel" aria-labelledby="mailbox-title">
-        <div class="panelhead"><div><h2 id="mailbox-title">Mailbox and automation</h2><p>Saved settings apply on the next inbox poll.</p></div><span class="chip">IMAP over TLS</span></div>
+        <div class="panelhead"><div><h2 id="mailbox-title">Mailbox and automation</h2><p>Saved settings apply on the next check. Only new mail in the selected folder is read.</p></div><span class="chip">IMAP over TLS</span></div>
         <form method="post" action="/settings/save" class="form-stack">
           <input type="hidden" name="token" value="{{ token }}">
-          <label class="toggle"><input type="checkbox" name="mail_enabled" value="1" {% if config.mail_enabled=='1' %}checked{% endif %}><span><strong>Enable automatic email printing</strong><small>Poll unread messages and submit supported attachments. Save this form after turning it on.</small></span></label>
+          <label class="toggle"><input type="checkbox" name="mail_enabled" value="1" {% if config.mail_enabled=='1' %}checked{% endif %}><span><strong>Enable automatic email printing</strong><small>Watch the selected folder and print new mail as it arrives. Mail already in the folder is left alone. Save after turning this on.</small></span></label>
           <div class="section-title">Mail connection</div>
           <div class="form-row">
             <label>IMAP server<input name="imap_host" required value="{{ config.imap_host }}" placeholder="imap.gmail.com" autocapitalize="off" spellcheck="false"></label>
@@ -220,9 +220,9 @@
           <label>Mailbox folder<select name="imap_folder" required>{% for folder in folders %}<option value="{{ folder }}" {% if config.imap_folder==folder %}selected{% endif %}>{{ folder }}</option>{% endfor %}</select><small>Load the mailbox folders, then choose one. The saved folder stays listed before you load.</small></label>
           <button class="button subtle" type="submit" formaction="/mail/folders">Load folders</button>
           <div class="section-title">Security controls</div>
-          <label>Approved sender emails<input name="allowed_senders" value="{{ config.allowed_senders }}" placeholder="you@gmail.com, home@gmail.com" autocapitalize="off" spellcheck="false"><small>Leave blank to accept mail from any sender. When filled, only these exact addresses can submit jobs. Separate them with commas.</small></label>
-          <label>Required destination email<input name="mail_recipient" type="email" value="{{ config.mail_recipient }}" placeholder="printer@gmail.com"><small>Optional. When set, To or Cc must include this address.</small></label>
-          <label>Email subject PIN<input name="new_pin" minlength="6" maxlength="32" pattern="[A-Za-z0-9]{6,32}" autocapitalize="off" autocorrect="off" spellcheck="false" placeholder="Leave blank to keep current"><small>Current PIN: <code>{{ config.email_pin or 'not set' }}</code>. The sender list does not stop a spoofed From address. Use 6 to 32 letters or digits.</small></label>
+          <label>Approved sender emails<input name="allowed_senders" value="{{ config.allowed_senders }}" placeholder="Leave blank to accept any sender" autocapitalize="off" spellcheck="false"><small>Leave blank to accept mail from any sender. When filled, only these exact addresses can submit jobs. Separate them with commas.</small></label>
+          <label>Required destination email<input name="mail_recipient" type="email" value="{{ config.mail_recipient }}" placeholder="Leave blank to ignore destination"><small>Leave blank to accept any To or Cc. When filled, To or Cc must include this address.</small></label>
+          <label>Email subject PIN<input name="new_pin" maxlength="32" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" placeholder="Leave blank to require no PIN"><small>{% if config.email_pin %}A PIN is on. Leave this box blank and save to turn it off. Type the PIN shown in the examples to keep it, or type a new one to replace it.{% else %}No PIN is required. Enter 6 to 32 letters or digits to require one, or leave blank.{% endif %}</small></label>
           <div class="section-title">Print behavior</div>
           {% if not printers %}<p class="form-help">Add a printer before email intake can submit jobs.</p>{% endif %}
           <div class="form-row">
@@ -233,7 +233,7 @@
             <label>Maximum pages per file<input type="number" name="max_pages" min="1" max="200" value="{{ config.max_pages }}" inputmode="numeric"></label>
             <label>Maximum file size (MB)<input type="number" name="max_mb" min="1" max="30" value="{{ config.max_mb }}" inputmode="numeric"></label>
             <label>Attachments per message<input type="number" name="max_files" min="1" max="10" value="{{ config.max_files }}" inputmode="numeric"></label>
-            <label>Poll interval (seconds)<input type="number" name="poll_seconds" min="20" max="3600" value="{{ config.poll_seconds }}" inputmode="numeric"></label>
+            <label>Backup check (seconds)<input type="number" name="poll_seconds" min="2" max="3600" value="{{ config.poll_seconds }}" inputmode="numeric"><small>New mail is picked up as it arrives. This backup check is used only when the mailbox cannot push, and it never waits more than 5 seconds.</small></label>
           </div>
           <label class="toggle"><input type="checkbox" name="print_email_body" value="1" {% if config.print_email_body=='1' %}checked{% endif %}><span><strong>Print plain-text body as fallback</strong><small>Only when the message has no supported attachment.</small></span></label>
           <div class="section-title">Result email</div>
@@ -249,16 +249,16 @@
       <div class="two-col">
         <section class="panel" aria-labelledby="examples-title">
           <h2 id="examples-title">Subject examples</h2>
-          <p class="muted">Replace the PIN below with the current PIN if you rotate it.</p>
-          <div class="command-example"><span>Single-sided</span><code>PRINT PIN:{{ config.email_pin or 'YOURPIN' }}</code></div>
-          <div class="command-example"><span>Long-edge duplex</span><code>PRINT PIN:{{ config.email_pin or 'YOURPIN' }} DUPLEX</code></div>
-          <div class="command-example"><span>3 copies, duplex</span><code>PRINT PIN:{{ config.email_pin or 'YOURPIN' }} DUPLEX COPIES=3</code></div>
-          <div class="command-example"><span>Short-edge duplex</span><code>PRINT PIN:{{ config.email_pin or 'YOURPIN' }} SHORT EDGE</code></div>
+          <p class="muted">{% if config.email_pin %}Put the current PIN in the subject. Clear the PIN field above and save to stop requiring one.{% else %}No PIN is set. DUPLEX, 2-SIDED, SHORT EDGE, and COPIES= still work.{% endif %}</p>
+          <div class="command-example"><span>Single-sided</span><code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %}</code></div>
+          <div class="command-example"><span>Long-edge duplex</span><code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} DUPLEX</code></div>
+          <div class="command-example"><span>3 copies, duplex</span><code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} DUPLEX COPIES=3</code></div>
+          <div class="command-example"><span>Short-edge duplex</span><code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} SHORT EDGE</code></div>
         </section>
         <section class="panel" aria-labelledby="security-title">
           <h2 id="security-title">What is enforced</h2>
           <ul class="plainlist">
-            <li>Sender allowlist when one is set; a blank list accepts any sender. The subject PIN is still required</li>
+            <li>Leave the sender list, destination, or PIN blank to turn that check off. Filled fields are still enforced</li>
             <li>IMAP over TLS, with the mailbox password encrypted at rest</li>
             <li>Attachment size, count, and PDF page limits</li>
             <li>UID deduplication so a seen message is not printed twice</li>
