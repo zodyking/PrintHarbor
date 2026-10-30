@@ -1,0 +1,17 @@
+name: printharbor
+
+services:
+  printharbor:
+    build: .
+    restart: unless-stopped
+    cap_add:
+      - NET_ADMIN
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    environment:
+      DATA_DIR: /data
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD}
+      ADMIN_USER: ${ADMIN_USER:-admin}
+    ports:
+      - "47831"
