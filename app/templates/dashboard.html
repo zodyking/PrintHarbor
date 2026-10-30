@@ -61,11 +61,11 @@
           {% endif %}
         </section>
         <section class="panel" aria-labelledby="printer-status-title">
-          <div class="panelhead"><div><h2 id="printer-status-title">Printer status</h2><p>TCP check on port 631 for IPP, or 9100 for raw.</p></div></div>
+          <div class="panelhead"><div><h2 id="printer-status-title">Printer status</h2><p>Shows whether this host can reach the printer.</p></div></div>
           {% if printers %}
           <div class="printer-list">
             {% for p in printers %}
-            <div class="printer-line"><div class="printer-glyph" aria-hidden="true">▣</div><div><strong>{{ p.label }}</strong><small>{{ p.host }} · {{ p.protocol|upper }} · {{ p.queue }}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span></div>
+            <div class="printer-line"><div class="printer-glyph" aria-hidden="true">▣</div><div><strong>{{ p.label }}</strong><small>{{ p.identity or p.host }} · {{ p.queue }}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span></div>
             {% endfor %}
           </div>
           {% else %}
@@ -87,14 +87,14 @@
         {% endif %}
       </section>
     {% elif page=='printers' %}
-      <div class="headerline"><div><div class="eyebrow">Queues</div><h1>Printers</h1><p class="muted">Register an IPP queue or a raw port 9100 queue.</p></div></div>
+      <div class="headerline"><div><div class="eyebrow">Queues</div><h1>Printers</h1><p class="muted">Add a printer by its address. PrintHarbor reads it and selects a driver.</p></div></div>
       <div class="two-col">
         <section class="panel" aria-labelledby="destinations-title">
           <div class="panelhead"><div><h2 id="destinations-title">Connected destinations</h2><p>{{ printers|length }} registered print {{ 'queue' if printers|length==1 else 'queues' }}.</p></div></div>
           {% if printers %}
           <div class="printer-list">
             {% for p in printers %}
-            <div class="printer-line expand"><div class="printer-glyph" aria-hidden="true">▣</div><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.queue }} · {{ p.host }} · {{ p.protocol|upper }}</small><small>{% if p.pages_total %}SNMP lifetime page count: {{ p.pages_total }}{% else %}SNMP page count not available{% endif %}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer queue {{ p.queue }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.queue }}">Remove</button></form></div>
+            <div class="printer-line expand"><div class="printer-glyph" aria-hidden="true">▣</div><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}{% if p.pages_total %} · {{ p.pages_total }} pages{% endif %}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
             {% endfor %}
           </div>
           {% else %}
@@ -102,16 +102,30 @@
           {% endif %}
         </section>
         <section class="panel" aria-labelledby="add-printer-title">
+          {% if editing %}
+          <div class="panelhead"><div><h2 id="add-printer-title">Edit {{ editing.label }}</h2><p>Change the name or address. The queue name stays the same.</p></div></div>
+          <form class="form-stack" method="post" action="/printers/edit">
+            <input type="hidden" name="token" value="{{ token }}">
+            <input type="hidden" name="queue" value="{{ editing.queue }}">
+            <label>Display name<input name="label" value="{{ editing.label }}" required maxlength="100"></label>
+            <p class="form-help">Queue name: {{ editing.queue }}</p>
+            <label>Printer IPv4<input name="host" required value="{{ editing.host }}" inputmode="decimal" autocomplete="off" spellcheck="false" aria-describedby="printer-help"></label>
+            <p id="printer-help" class="form-help">Saving a new address reads the printer again. Use “Read printer again” to refresh the driver without renaming it.</p>
+            <button class="button" type="submit" name="action" value="save">Save printer</button>
+            <button class="button subtle" type="submit" name="action" value="reread">Read printer again</button>
+            <a class="text-button" href="/?page=printers">Cancel</a>
+          </form>
+          {% else %}
           <div class="panelhead"><div><h2 id="add-printer-title">Add a printer</h2><p>Use the printer address reachable from this host.</p></div></div>
           <form class="form-stack" method="post" action="/printers/add">
             <input type="hidden" name="token" value="{{ token }}">
             <label>Display name<input name="label" placeholder="Brother HL-L2380DW" required maxlength="100"></label>
-            <label>CUPS queue name<input name="queue" placeholder="Office_Brother" required pattern="[A-Za-z][A-Za-z0-9_-]{0,40}" maxlength="41" autocapitalize="off" spellcheck="false"></label>
-            <label>Printer IPv4<input name="host" required placeholder="192.168.50.40" inputmode="decimal" autocomplete="off" spellcheck="false"></label>
-            <label>Connection<select name="protocol" aria-describedby="protocol-help"><option value="ipp">IPP</option><option value="socket">Raw port 9100</option></select></label>
-            <p id="protocol-help" class="form-help">IPP uses <code>ipp://address/ipp/print</code>. If IPP Everywhere fails, the error from CUPS is shown and the queue is not marked as added.</p>
+            <label>Queue name<input name="queue" placeholder="Office" required pattern="[A-Za-z][A-Za-z0-9_-]{0,40}" maxlength="41" autocapitalize="off" spellcheck="false"></label>
+            <label>Printer IPv4<input name="host" required placeholder="192.168.50.40" inputmode="decimal" autocomplete="off" spellcheck="false" aria-describedby="printer-help"></label>
+            <p id="printer-help" class="form-help">PrintHarbor reads the make and model, then picks a matching driver. A Brother laser uses the Brother driver so the page stays dark. Other printers use the description they provide.</p>
             <button class="button" type="submit">Create printer queue <span aria-hidden="true">→</span></button>
           </form>
+          {% endif %}
         </section>
       </div>
       <section class="panel" aria-labelledby="cups-status-title">

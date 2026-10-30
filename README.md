@@ -9,8 +9,8 @@ Use PrintHarbor on a host that can reach your printer. That host can be on the s
 ## Capabilities
 
 - One admin account, created on first launch from `ADMIN_USER` (default `admin`) and `ADMIN_PASSWORD`
-- IPP queues at `ipp://address/ipp/print`, or raw port 9100 queues, with remove and CUPS queue listing
-- Printer reachability over TCP port 631 for IPP, or port 9100 for raw
+- Printer setup from an IPv4 address. PrintHarbor reads the printer over IPP, port 9100, and SNMP, then selects a matching installed driver. If none matches, the printer's own IPP description is used. A matched Brother laser uses the Brother driver on port 9100, with toner save off and the darkest density step
+- Printer reachability on the port that driver uses
 - Optional SNMP lifetime page count when `snmpget` is installed (a page counter, separate from toner level)
 - Browser upload of PDF, PNG, JPEG, WEBP, TIFF, TXT, DOCX, XLSX, ODT, and ODS
 - Conversion to PDF: images and plain text in the app, Office files through LibreOffice
@@ -101,7 +101,7 @@ On Windows PowerShell, set `DATA_DIR`, `SESSION_SECRET`, and `ADMIN_PASSWORD` wi
 
 After the dashboard is up:
 
-1. Open Printers and add the printer IPv4 address. Prefer IPP. If CUPS rejects the queue, the error is shown and the printer is not saved.
+1. Open Printers and add the printer IPv4 address. PrintHarbor reads the printer and selects a driver. If the queue cannot be created, the error is shown and the printer is not saved. Saved printers are read again the next time the app starts, and left unchanged if a printer does not answer.
 2. Send a single-page PDF with Quick print before enabling email.
 3. Open Email automation. Enter the mailbox, app password, and default queue, then load and choose a folder. A later save can leave the password blank to keep the saved one. Leave the sender list, destination, and PIN blank to turn those checks off, or fill any of them to enforce it. A PIN is 6 to 32 letters or digits. Saving with the PIN box empty turns the PIN off.
 4. Enable automatic email printing and save.
