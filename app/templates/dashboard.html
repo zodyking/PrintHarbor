@@ -156,7 +156,7 @@
       {% else %}
       <section class="panel" aria-labelledby="tail-blocked-title">
         <div class="panelhead"><div><h2 id="tail-blocked-title">Tailscale needs the tunnel device</h2><p>{{ tail.detail }}</p></div></div>
-        <p class="form-help">A normal Dokploy application cannot open <code>/dev/net/tun</code>. Create a Compose application instead, with compose file <code>compose.dokploy.yaml</code>, the same <code>SESSION_SECRET</code> and <code>ADMIN_PASSWORD</code>, and the domain pointed at port 47831. After that deploy, this page accepts an auth key.</p>
+        <p class="form-help">A normal Dokploy application cannot open <code>/dev/net/tun</code>. Create a Compose application instead, with compose file <code>docker-compose.yml</code>, the same <code>SESSION_SECRET</code> and <code>ADMIN_PASSWORD</code>, and the domain pointed at port 47831. After that deploy, this page accepts an auth key.</p>
       </section>
       {% endif %}
     {% elif page=='jobs' %}
