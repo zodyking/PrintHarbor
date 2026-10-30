@@ -20,7 +20,7 @@ Use PrintHarbor on a host that can reach your printer. That host can be on the s
 - Sender allowlist, mandatory subject PIN, and an optional check that To or Cc includes a chosen address
 - Subject commands for long-edge duplex (`DUPLEX` or `2-SIDED`), short-edge duplex (`SHORT EDGE`), and `COPIES=` from 1 to 10
 - Event log for rejections, CUPS results, and settings changes
-- Tailscale status when the local tailscaled socket is present
+- Tailscale join from the dashboard, when the container can open `/dev/net/tun`
 
 Submitted means CUPS accepted the job. A sheet leaving the printer is a separate outcome.
 

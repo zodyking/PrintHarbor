@@ -13,7 +13,7 @@ os.environ['ADMIN_PASSWORD']='test-only-admin-password-not-public'
 _temp=tempfile.TemporaryDirectory(prefix='printharbor-test-')
 os.environ['DATA_DIR']=_temp.name
 
-from app import mailer, printing, store
+from app import mailer, printing, store, tailnet
 
 class CoreTests(unittest.TestCase):
     @classmethod
@@ -98,6 +98,7 @@ class CoreTests(unittest.TestCase):
                 ('/?page=printers','Add a printer'),
                 ('/?page=jobs','Job log'),
                 ('/?page=email','Approved sender emails'),
+                ('/?page=tailscale','Join this container to your tailnet'),
             ):
                 body=client.get(path)
                 self.assertEqual(body.status_code,200,path)
@@ -238,5 +239,39 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(mailer.allowed_message(msg,cfg)[2]['sides'],'one-sided')
         self.assertEqual(mailer.summarize_poll(0,0)[0],'Healthy')
         self.assertEqual(mailer.summarize_poll(2,1)[0],'Attention')
+
+    def test_tailscale_rejects_a_bad_key_before_calling_the_client(self):
+        with self.assertRaises(tailnet.TailscaleError):
+            tailnet.connect('not-a-key', 'printharbor')
+        with patch('app.tailnet.shutil.which', return_value='/usr/bin/tailscale'), patch('app.tailnet.Path.exists', return_value=True), patch('app.tailnet._run') as run:
+            with self.assertRaises(tailnet.TailscaleError):
+                tailnet.connect('tskey-auth-' + ('a' * 24), 'Bad Host')
+            run.assert_not_called()
+            key = 'tskey-auth-' + ('b' * 24)
+            run.return_value = SimpleNamespace(returncode=1, stdout='', stderr='rejected ' + key)
+            with self.assertRaises(tailnet.TailscaleError) as caught:
+                tailnet.connect(key, 'printharbor')
+            self.assertNotIn(key, str(caught.exception))
+
+    def test_tailscale_form_and_unauthenticated_join(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with TestClient(app) as client:
+            denied = client.post('/tailscale/up', data={'token': 'x', 'auth_key': 'tskey-auth-secret', 'hostname': 'printharbor'}, follow_redirects=False)
+            self.assertEqual(denied.status_code, 303)
+            self.assertIn('/login', denied.headers['location'])
+            client.post('/login', data={'username': 'admin', 'password': os.environ['ADMIN_PASSWORD']}, follow_redirects=False)
+            ready = {
+                'state': 'NeedsLogin', 'ip': '', 'hostname': '', 'online': False,
+                'installed': True, 'tun': True, 'detail': 'Paste an auth key to join the tailnet.',
+            }
+            with patch('app.tailnet.status', return_value=ready):
+                page = client.get('/?page=tailscale')
+                self.assertIn('Auth key', page.text)
+                self.assertNotIn('type="password" value=', page.text)
+                token = re.search(r'name="token" value="([^"]+)"', page.text).group(1)
+            bad = client.post('/tailscale/up', data={'token': token, 'auth_key': 'not-a-key', 'hostname': 'printharbor'}, follow_redirects=False)
+            self.assertIn('error=', bad.headers['location'])
+            self.assertNotIn('not-a-key', bad.headers['location'])
 
 if __name__=='__main__': unittest.main()

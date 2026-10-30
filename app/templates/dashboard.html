@@ -1,4 +1,4 @@
-{% set labels = {'overview':'Overview','printers':'Printers','jobs':'Print jobs','email':'Email automation'} %}
+{% set labels = {'overview':'Overview','printers':'Printers','jobs':'Print jobs','email':'Email automation','tailscale':'Tailscale'} %}
 {% set side_labels = {'one-sided':'Single-sided','two-sided-long-edge':'Long-edge duplex','two-sided-short-edge':'Short-edge duplex'} %}
 {% set tone = 'good' if mail.state=='Healthy' else ('bad' if mail.state=='Error' else 'warn') %}
 <!doctype html>
@@ -7,7 +7,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
-  <link rel="stylesheet" href="/static/style.css?v=2">
+  <link rel="stylesheet" href="/static/style.css?v=3">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
@@ -21,10 +21,11 @@
       <li><a class="navlink {% if page=='printers' %}active{% endif %}" {% if page=='printers' %}aria-current="page"{% endif %} href="/?page=printers"><span class="nav-icon" aria-hidden="true">▣</span> Printers</a></li>
       <li><a class="navlink {% if page=='jobs' %}active{% endif %}" {% if page=='jobs' %}aria-current="page"{% endif %} href="/?page=jobs"><span class="nav-icon" aria-hidden="true">≡</span> Print jobs</a></li>
       <li><a class="navlink {% if page=='email' %}active{% endif %}" {% if page=='email' %}aria-current="page"{% endif %} href="/?page=email"><span class="nav-icon" aria-hidden="true">✉</span> Email automation</a></li>
+      <li><a class="navlink {% if page=='tailscale' %}active{% endif %}" {% if page=='tailscale' %}aria-current="page"{% endif %} href="/?page=tailscale"><span class="nav-icon" aria-hidden="true">◎</span> Tailscale</a></li>
     </ul>
   </nav>
   <div class="sidebar-bottom">
-    <div class="tail-info"><span class="green-dot {% if not tail.online %}is-warn{% endif %}"></span><div><strong>Tailscale {{ tail.state }}</strong><small>{{ tail.ip or "No tailnet address" }}</small></div></div>
+    <a class="tail-info" href="/?page=tailscale"><span class="green-dot {% if not tail.online %}is-warn{% endif %}"></span><div><strong>Tailscale {{ tail.state }}</strong><small>{{ tail.ip or "No tailnet address" }}</small></div></a>
     <form method="post" action="/logout"><input type="hidden" name="token" value="{{ token }}"><button class="signout" type="submit">Sign out</button></form>
   </div>
 </aside>
@@ -128,9 +129,36 @@
         <div class="check-grid">
           <div><b>01</b><strong>Subnet route to the printer</strong><p>An always-on device on the printer LAN must advertise that printer's address, preferably as a /32.</p></div>
           <div><b>02</b><strong>Approve the route</strong><p>Approve it in the Tailscale admin console and allow this node in the tailnet policy.</p></div>
-          <div><b>03</b><strong>Use the printer LAN address</strong><p>This host's Tailscale client accepts advertised routes. Enter that LAN address above, not a public address.</p></div>
+          <div><b>03</b><strong>Use the printer LAN address</strong><p>After this container joins the tailnet, enter that LAN address above, not a public address.</p></div>
         </div>
       </section>
+    {% elif page=='tailscale' %}
+      <div class="headerline"><div><div class="eyebrow">Remote path</div><h1>Tailscale</h1><p class="muted">Join this container to your tailnet so it can reach a printer on another network.</p></div></div>
+      {% if tail.online %}
+      <section class="panel" aria-labelledby="tail-status-title">
+        <div class="panelhead"><div><h2 id="tail-status-title">Connected</h2><p>{{ tail.hostname or 'This node' }} is on the tailnet.</p></div><span class="status online">Running</span></div>
+        <p class="form-help">Tailnet address: {{ tail.ip or 'assigned' }}. Advertised printer routes must still be approved in the Tailscale admin console. Then add the printer by its LAN address.</p>
+        <form method="post" action="/tailscale/down" class="form-stack">
+          <input type="hidden" name="token" value="{{ token }}">
+          <button class="button subtle" type="submit">Log out of Tailscale</button>
+        </form>
+      </section>
+      {% elif tail.installed and tail.tun %}
+      <section class="panel" aria-labelledby="tail-join-title">
+        <div class="panelhead"><div><h2 id="tail-join-title">Join the tailnet</h2><p>Create a reusable auth key in the Tailscale admin console. An ephemeral key is the right kind for this container.</p></div></div>
+        <form method="post" action="/tailscale/up" class="form-stack">
+          <input type="hidden" name="token" value="{{ token }}">
+          <label>Auth key<input name="auth_key" type="password" required autocomplete="off" spellcheck="false" placeholder="tskey-auth-..."><small>Used once to join. It is not saved in PrintHarbor.</small></label>
+          <label>Hostname<input name="hostname" value="printharbor" maxlength="63" autocapitalize="off" spellcheck="false" pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"><small>The name of this node in your tailnet.</small></label>
+          <button class="button" type="submit">Connect Tailscale <span aria-hidden="true">→</span></button>
+        </form>
+      </section>
+      {% else %}
+      <section class="panel" aria-labelledby="tail-blocked-title">
+        <div class="panelhead"><div><h2 id="tail-blocked-title">Tailscale needs the tunnel device</h2><p>{{ tail.detail }}</p></div></div>
+        <p class="form-help">A normal Dokploy application cannot open <code>/dev/net/tun</code>. Create a Compose application instead, with compose file <code>compose.dokploy.yaml</code>, the same <code>SESSION_SECRET</code> and <code>ADMIN_PASSWORD</code>, and the domain pointed at port 47831. After that deploy, this page accepts an auth key.</p>
+      </section>
+      {% endif %}
     {% elif page=='jobs' %}
       <div class="headerline"><div><div class="eyebrow">History</div><h1>Print jobs</h1><p class="muted">Submitted means CUPS accepted the job, not that a page printed.</p></div></div>
       <section class="panel" aria-labelledby="job-log-title">

@@ -78,7 +78,7 @@ def logout(request: Request, token: str = Form(...)):
 @app.get('/', response_class=HTMLResponse)
 def index(request: Request, page: str = 'overview'):
     require_auth(request)
-    if page not in ('overview', 'printers', 'jobs', 'email'):
+    if page not in ('overview', 'printers', 'jobs', 'email', 'tailscale'):
         page = 'overview'
     cfg = store.settings()
     printers = store.records('printers')
@@ -228,6 +228,26 @@ def save_settings(
             store.set_setting('email_pin', pin, db=db)
     store.event('info', 'Email printing settings updated')
     return nextpage('email', 'Settings saved')
+
+@app.post('/tailscale/up')
+def tailscale_up(request: Request, token: str = Form(...), auth_key: str = Form(...), hostname: str = Form('printharbor')):
+    csrf(request, token)
+    try:
+        tailnet.connect(auth_key, hostname)
+        store.event('info', 'Tailscale joined the tailnet')
+        return nextpage('tailscale', 'Tailscale connected')
+    except Exception as exc:
+        return nextpage('tailscale', error=str(exc))
+
+@app.post('/tailscale/down')
+def tailscale_down(request: Request, token: str = Form(...)):
+    csrf(request, token)
+    try:
+        tailnet.disconnect()
+        store.event('info', 'Tailscale logged out')
+        return nextpage('tailscale', 'Tailscale logged out')
+    except Exception as exc:
+        return nextpage('tailscale', error=str(exc))
 
 @app.get('/api/health')
 def health(request: Request):
