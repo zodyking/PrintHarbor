@@ -1,0 +1,56 @@
+name: printharbor
+services:
+  tailscale:
+    image: tailscale/tailscale:stable
+    hostname: ${TAILSCALE_HOSTNAME:-printharbor}
+    environment:
+      TS_AUTHKEY: ${TS_AUTHKEY:?Create a reusable Tailscale auth key and enter it in .env}
+      TS_AUTH_ONCE: "true"
+      TS_HOSTNAME: ${TAILSCALE_HOSTNAME:-printharbor}
+      TS_SOCKET: /var/run/tailscale/tailscaled.sock
+      TS_STATE_DIR: /var/lib/tailscale
+      TS_USERSPACE: "false"
+      TS_ACCEPT_DNS: "false"
+      TS_EXTRA_ARGS: "--accept-routes"
+    volumes:
+      - tailscale-state:/var/lib/tailscale
+      - tailscale-socket:/var/run/tailscale
+    devices:
+      - /dev/net/tun:/dev/net/tun
+    cap_add:
+      - NET_ADMIN
+      - NET_RAW
+    ports:
+      - "127.0.0.1:8765:8000"
+    restart: unless-stopped
+
+  printharbor:
+    build: .
+    network_mode: service:tailscale
+    depends_on:
+      - tailscale
+    environment:
+      DATA_DIR: /data
+      SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET in .env}
+      ADMIN_USER: ${ADMIN_USER:-admin}
+      ADMIN_PASSWORD: ${ADMIN_PASSWORD:?Set ADMIN_PASSWORD in .env}
+      POLL_SECONDS: ${POLL_SECONDS:-60}
+      SNMP_COMMUNITY: ${SNMP_COMMUNITY:-public}
+    volumes:
+      - tailscale-socket:/var/run/tailscale:ro
+      - printharbor-data:/data
+      - cups-config:/etc/cups
+      - cups-spool:/var/spool/cups
+      - cups-logs:/var/log/cups
+    init: true
+    security_opt:
+      - no-new-privileges:true
+    restart: unless-stopped
+
+volumes:
+  tailscale-socket:
+  tailscale-state:
+  printharbor-data:
+  cups-config:
+  cups-spool:
+  cups-logs:
