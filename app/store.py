@@ -18,6 +18,8 @@ DEFAULTS = {
     'default_queue': '', 'default_sides': 'one-sided', 'max_pages': '40',
     'max_files': '5', 'max_mb': '12', 'print_email_body': '0',
     'reply_enabled': '0', 'smtp_from': '', 'smtp_host': 'smtp.gmail.com', 'smtp_port': '587',
+    'images_auto': '1', 'images_unifi': '1', 'images_wikimedia': '1',
+    'images_cache': '1', 'images_catalog_days': '14',
 }
 
 def _key():
@@ -80,6 +82,22 @@ def initialize():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP, level TEXT, message TEXT
         );
+        CREATE TABLE IF NOT EXISTS image_catalog (
+            model_key TEXT PRIMARY KEY,
+            manufacturer TEXT DEFAULT '',
+            model TEXT DEFAULT '',
+            source TEXT DEFAULT '',
+            fingerprint_id TEXT DEFAULT '',
+            local_path TEXT DEFAULT '',
+            confidence REAL DEFAULT 0,
+            license TEXT DEFAULT '',
+            attribution TEXT DEFAULT '',
+            source_page TEXT DEFAULT '',
+            checked_at TEXT DEFAULT '',
+            negative_until TEXT DEFAULT '',
+            category TEXT DEFAULT 'generic',
+            candidates TEXT DEFAULT ''
+        );
         ''')
         db.execute('INSERT OR IGNORE INTO users VALUES (?,?)',
                    (os.getenv('ADMIN_USER', 'admin'), PH.hash(password)))
@@ -92,6 +110,19 @@ def initialize():
             db.execute("ALTER TABLE printers ADD COLUMN identity TEXT DEFAULT ''")
         if 'driver' not in columns:
             db.execute("ALTER TABLE printers ADD COLUMN driver TEXT DEFAULT ''")
+        for name, kind in (
+            ('image_mode', "TEXT DEFAULT 'auto'"),
+            ('image_key', "TEXT DEFAULT ''"),
+            ('image_source', "TEXT DEFAULT ''"),
+            ('image_path', "TEXT DEFAULT ''"),
+            ('image_license', "TEXT DEFAULT ''"),
+            ('image_attribution', "TEXT DEFAULT ''"),
+            ('image_page', "TEXT DEFAULT ''"),
+            ('image_fingerprint', "TEXT DEFAULT ''"),
+            ('image_candidates', "TEXT DEFAULT ''"),
+        ):
+            if name not in columns:
+                db.execute(f'ALTER TABLE printers ADD COLUMN {name} {kind}')
         db.execute(
             "UPDATE jobs SET status='error', error=? WHERE status='preparing'",
             ('Interrupted before the document was submitted',),
@@ -100,6 +131,7 @@ def initialize():
             "UPDATE jobs SET status='error', error=? WHERE status='sending'",
             ('Interrupted while sending to the printer',),
         )
+    (ROOT / 'images').mkdir(parents=True, exist_ok=True)
 
 def verify_user(username, password):
     with connection() as db:

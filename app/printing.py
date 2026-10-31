@@ -325,13 +325,13 @@ def choose_driver(discovery, drivers):
         if 'brlaser' in best['name']:
             if not discovery.get('socket'):
                 if discovery.get('ipp'):
-                    return {'model': 'everywhere', 'protocol': 'ipp', 'label': identity_label, 'driver': 'Described by the printer'}
+                    return {'model': 'everywhere', 'protocol': 'ipp', 'label': identity_label, 'driver': 'IPP Everywhere'}
                 raise PrintError('This printer needs port 9100, and that port did not answer')
-            return {'model': best['name'], 'protocol': 'socket', 'label': identity_label, 'driver': 'Brother driver, darkest setting'}
+            return {'model': best['name'], 'protocol': 'socket', 'label': identity_label, 'driver': driver_title(best)}
         if discovery.get('socket'):
-            return {'model': best['name'], 'protocol': 'socket', 'label': identity_label, 'driver': 'Matched driver'}
+            return {'model': best['name'], 'protocol': 'socket', 'label': identity_label, 'driver': driver_title(best)}
     if discovery.get('ipp'):
-        return {'model': 'everywhere', 'protocol': 'ipp', 'label': identity_label, 'driver': 'Described by the printer'}
+        return {'model': 'everywhere', 'protocol': 'ipp', 'label': identity_label, 'driver': 'IPP Everywhere'}
     raise PrintError('The printer answered, but no driver matched it')
 
 def load_drivers():
@@ -375,21 +375,110 @@ def density_options(lpoptions_text):
             chosen.append((key, max(numbered)[1]))
     return chosen
 
-def configure_queue(queue, address, discovery, drivers):
+def driver_title(driver):
+    """The driver's own name, such as the PPD make and model."""
+    title = (driver.get('make-and-model') or driver.get('name') or 'Driver').strip()
+    return title[:120]
+
+def parse_queue_options(text):
+    """Choices advertised by a queue. The starred value is the one in use."""
+    options = []
+    for line in (text or '').splitlines():
+        if ':' not in line:
+            continue
+        left, _, right = line.partition(':')
+        key = left.split('/', 1)[0].strip()
+        label = left.split('/', 1)[1].strip() if '/' in left else key
+        if not OPTION_RE.fullmatch(key):
+            continue
+        current = ''
+        values = []
+        for token in right.split():
+            chosen = token.startswith('*')
+            value = token[1:] if chosen else token
+            if not value or not OPTION_VALUE_RE.fullmatch(value) or value in values:
+                continue
+            values.append(value)
+            if chosen:
+                current = value
+        if len(values) < 2:
+            continue
+        options.append({
+            'key': key,
+            'label': (label or key)[:60],
+            'values': values[:12],
+            'current': current or values[0],
+        })
+    def rank(option):
+        low = f"{option['key']} {option['label']}".lower()
+        if any(word in low for word in ('economode', 'toner save', 'density')):
+            return 0
+        if any(word in low for word in ('resolution', 'duplex', 'sides', 'pagesize', 'media')):
+            return 1
+        return 2
+    options.sort(key=rank)
+    return options[:16]
+
+def queue_options(queue):
+    if not QUEUE_RE.fullmatch(queue or ''):
+        return []
+    try:
+        listed = cmd('lpoptions', '-p', queue, '-l', timeout=15)
+    except PrintError:
+        return []
+    if listed.returncode:
+        return []
+    return parse_queue_options(listed.stdout)
+
+def _set_options(queue, pairs):
+    for key, value in pairs:
+        if not OPTION_RE.fullmatch(key) or not OPTION_VALUE_RE.fullmatch(str(value)):
+            continue
+        result = cmd('lpadmin', '-p', queue, '-o', f'{key}={value}', timeout=15)
+        if result.returncode:
+            raise PrintError((result.stderr or result.stdout or f'{key} could not be saved')[:400])
+
+def apply_queue_options(queue, choices):
+    """Save the values the user picked. Unknown keys are ignored."""
+    if not QUEUE_RE.fullmatch(queue or ''):
+        raise PrintError('Invalid queue')
+    known = {item['key']: item for item in queue_options(queue)}
+    pairs = []
+    for key, value in (choices or {}).items():
+        option = known.get(key)
+        if not option or str(value) not in option['values'] or str(value) == option['current']:
+            continue
+        pairs.append((key, str(value)))
+    _set_options(queue, pairs)
+    if pairs:
+        store.event('success', f'Printer {queue} settings saved')
+    return [key for key, _ in pairs]
+
+def configure_queue(queue, address, discovery, drivers, keep_options=False):
     choice = choose_driver(discovery, drivers)
     if not MODEL_RE.fullmatch(choice['model']):
         raise PrintError('The selected driver name was not usable')
+    saved = [(item['key'], item['current']) for item in queue_options(queue)] if keep_options else []
     uri = f'socket://{address}:9100' if choice['protocol'] == 'socket' else f'ipp://{address}/ipp/print'
     result = cmd('lpadmin', '-p', queue, '-E', '-v', uri, '-m', choice['model'], timeout=40)
     if result.returncode:
         raise PrintError((result.stderr or result.stdout or 'The printer could not be added')[:400])
-    listed = cmd('lpoptions', '-p', queue, '-l', timeout=15)
-    if listed.returncode == 0:
-        for key, value in density_options(listed.stdout):
-            cmd('lpadmin', '-p', queue, '-o', f'{key}={value}', timeout=15)
+    if saved:
+        _set_options(queue, saved)
+    else:
+        listed = cmd('lpoptions', '-p', queue, '-l', timeout=15)
+        if listed.returncode == 0:
+            _set_options(queue, density_options(listed.stdout))
     cmd('cupsaccept', queue)
     cmd('cupsenable', queue)
     return choice
+
+def _note_image(queue):
+    try:
+        from . import images
+        images.attach(queue)
+    except Exception:
+        store.event('warning', 'Printer image could not be queued')
 
 def _save_printer(queue, label, address, choice):
     with store.connection() as db:
@@ -397,7 +486,7 @@ def _save_printer(queue, label, address, choice):
             'INSERT INTO printers(queue,label,host,protocol,identity,driver) VALUES (?,?,?,?,?,?) '
             'ON CONFLICT(queue) DO UPDATE SET label=excluded.label, host=excluded.host, '
             'protocol=excluded.protocol, identity=excluded.identity, driver=excluded.driver',
-            (queue, label[:100], address, choice['protocol'], choice['label'][:120], choice['driver'][:80]),
+            (queue, label[:100], address, choice['protocol'], choice['label'][:120], choice['driver'][:120]),
         )
 
 def add_printer(label, queue, ip, protocol='socket'):
@@ -411,6 +500,7 @@ def add_printer(label, queue, ip, protocol='socket'):
         raise PrintError('The printer did not answer. Check the address and that this host can reach it.')
     choice = configure_queue(queue, address, discovery, load_drivers())
     _save_printer(queue, label, address, choice)
+    _note_image(queue)
     store.event('success', f'Printer {queue} configured on {address} ({choice["label"][:80]})')
     return choice['label']
 
@@ -429,13 +519,15 @@ def update_printer(queue, label, ip, reread=False):
     if address == row['host'] and not reread:
         with store.connection() as db:
             db.execute('UPDATE printers SET label=? WHERE queue=?', (name, queue))
+        _note_image(queue)
         store.event('success', f'Printer {queue} renamed to {name}')
         return (row['identity'] or name)[:120]
     discovery = discover_printer(address)
     if not discovery.get('reachable'):
         raise PrintError('The printer did not answer. The saved printer was left unchanged.')
-    choice = configure_queue(queue, address, discovery, load_drivers())
+    choice = configure_queue(queue, address, discovery, load_drivers(), keep_options=(address == row['host']))
     _save_printer(queue, name, address, choice)
+    _note_image(queue)
     store.event('success', f'Printer {queue} updated on {address} ({choice["label"][:80]})')
     return choice['label']
 
@@ -460,11 +552,12 @@ def retarget_saved_queues():
             if not discovery.get('reachable'):
                 store.event('warning', f'Printer {queue} did not answer, so its driver was left as-is')
                 continue
-            choice = configure_queue(queue, address, discovery, drivers)
+            choice = configure_queue(queue, address, discovery, drivers, keep_options=True)
         except Exception as exc:
             store.event('warning', f'Printer {queue} was not updated: {exc}'[:240])
             continue
         _save_printer(queue, row['label'] or queue, address, choice)
+        _note_image(queue)
 
 def remove_printer(queue):
     if not QUEUE_RE.fullmatch(queue):
@@ -713,7 +806,7 @@ def _release_queue(queue):
                     ('Printer not configured', job['id']),
                 )
             continue
-        if not printer_reachable(printer['host'], printer['protocol']):
+        if not printer_reachable(printer['host'], printer['protocol'], timeout=1):
             return
         try:
             dispatch(job['id'])
@@ -726,7 +819,7 @@ def run_queue():
             release_queues()
         except Exception:
             store.event('warning', 'The print queue could not be checked')
-        STOP.wait(3)
+        STOP.wait(0.4)
 
 def requeue(job_id):
     with store.connection() as db:
@@ -874,7 +967,7 @@ def readings_from_ipp(attrs):
         'state': state,
         'reasons': reasons[:4],
         'pages': None,
-        'supplies': supplies[:3],
+        'supplies': supplies[:6],
         'serial': str(serial).strip()[:40],
         'firmware': firmware,
     }
@@ -923,7 +1016,44 @@ def readings_from_snmp(lines):
         if percent is None:
             continue
         supplies.append({'name': name[:40], 'percent': percent})
-    return {'state': state, 'reasons': [], 'pages': pages, 'supplies': supplies[:3], 'serial': serial, 'firmware': ''}
+    return {'state': state, 'reasons': [], 'pages': pages, 'supplies': supplies[:6], 'serial': serial, 'firmware': ''}
+
+def condition(stats, online=False):
+    """Toner, drum, paper, and jam as separate readings. Unknown when the printer did not say."""
+    blank = {'toner': None, 'drum': None, 'paper': 'unknown', 'jam': 'unknown', 'mark': 'Toner', 'note': ''}
+    if not online or not stats:
+        return blank
+    toner = None
+    drum = None
+    mark = 'Toner'
+    for item in stats.get('supplies') or []:
+        name = str(item.get('name') or '')
+        low = name.lower()
+        if any(word in low for word in ('drum', 'opc', 'imaging', 'photoconductor')):
+            if drum is None:
+                drum = item
+            continue
+        if 'ink' in low:
+            mark = 'Ink'
+        if toner is None and 'waste' not in low:
+            toner = item
+    reasons = [str(item) for item in (stats.get('reasons') or [])]
+    if any(item in reasons for item in ('Out of paper', 'Paper needed')):
+        paper = 'empty'
+    elif 'Paper low' in reasons:
+        paper = 'low'
+    else:
+        paper = 'ready'
+    jam = 'jam' if 'Paper jam' in reasons else 'clear'
+    notes = [item for item in reasons if item not in ('Out of paper', 'Paper needed', 'Paper low', 'Paper jam')]
+    return {
+        'toner': toner,
+        'drum': drum,
+        'paper': paper,
+        'jam': jam,
+        'mark': mark,
+        'note': notes[0] if notes else '',
+    }
 
 def printer_stats(host):
     """Live snapshot. Empty when the printer does not answer IPP or SNMP."""

@@ -1,4 +1,5 @@
 """Unit and route smoke tests. Run with `python -m unittest discover -s tests -v`."""
+import json
 import os
 import re
 import tempfile
@@ -10,10 +11,11 @@ from unittest.mock import patch
 
 os.environ['SESSION_SECRET']='test-only-key-at-least-thirty-two-characters'
 os.environ['ADMIN_PASSWORD']='test-only-admin-password-not-public'
+os.environ['PRINTHARBOR_IMAGE_NETWORK']='0'
 _temp=tempfile.TemporaryDirectory(prefix='printharbor-test-')
 os.environ['DATA_DIR']=_temp.name
 
-from app import mailer, printing, store, supplies, tailnet
+from app import images, mailer, printing, store, supplies, tailnet
 
 class CoreTests(unittest.TestCase):
     @classmethod
@@ -205,12 +207,13 @@ class CoreTests(unittest.TestCase):
         }, drivers)
         self.assertEqual(brother['model'],'drv:///brlaser.drv/brl2380d.ppd')
         self.assertEqual(brother['protocol'],'socket')
-        self.assertEqual(brother['driver'],'Brother driver, darkest setting')
+        self.assertEqual(brother['driver'],'Brother HL-L2380DW series, using brlaser v6.2.8')
         epson=printing.choose_driver({
             'reachable':True,'ipp':False,'socket':True,'make':'Epson','model':'ET-2760','identity':'Epson ET-2760',
         }, drivers)
         self.assertEqual(epson['model'],'gutenprint.5.3://epson/epson-et-2760')
         self.assertEqual(epson['protocol'],'socket')
+        self.assertEqual(epson['driver'],'Epson ET-2760')
         described=printing.choose_driver({
             'reachable':True,'ipp':True,'socket':False,'make':'HP','model':'OfficeJet Pro 9020','identity':'HP OfficeJet Pro 9020',
         }, drivers)
@@ -267,6 +270,17 @@ class CoreTests(unittest.TestCase):
             live=printing.printer_stats('192.0.2.40')
         self.assertEqual(live['pages_label'],'8,421')
         self.assertEqual(live['supplies'][1]['name'],'Drum Unit')
+        ready=printing.condition(live, online=True)
+        self.assertEqual(ready['paper'],'ready')
+        self.assertEqual(ready['jam'],'clear')
+        self.assertEqual(ready['drum']['percent'],80)
+        self.assertEqual(ready['toner']['name'],'Black Toner Cartridge')
+        jammed=printing.condition({'reasons':['Paper jam','Out of paper'],'supplies':[{'name':'Black Ink','percent':12}]}, online=True)
+        self.assertEqual(jammed['paper'],'empty')
+        self.assertEqual(jammed['jam'],'jam')
+        self.assertEqual(jammed['mark'],'Ink')
+        self.assertEqual(printing.condition(None, online=False)['paper'],'unknown')
+        self.assertEqual(printing.condition(None, online=False)['jam'],'unknown')
         with patch.object(printing,'ipp_attributes',return_value={}), patch.object(printing,'_snmp_lines',return_value=None):
             self.assertIsNone(printing.printer_stats('192.0.2.40'))
         listed='\n'.join([
@@ -331,7 +345,9 @@ class CoreTests(unittest.TestCase):
         self.assertIn('Toner low', page.text)
         self.assertIn('>Idle<', page.text)
         self.assertIn('TN660', page.text)
-        self.assertIn('Toner, ink, and page count, read when this page opens.', page.text)
+        self.assertIn('In the tray', page.text)
+        self.assertIn('Clear', page.text)
+        self.assertIn('Drum', page.text)
 
     def test_printer_page_shows_live_readings(self):
         with store.connection() as db:
@@ -353,7 +369,9 @@ class CoreTests(unittest.TestCase):
         self.assertIn('E12345', page.text)
         self.assertIn('1.23', page.text)
         self.assertIn('>Stopped<', page.text)
-        self.assertIn('Status, toner, and page count are read when this page opens.', page.text)
+        self.assertIn('Paper jam', page.text)
+        self.assertIn('In the tray', page.text)
+        self.assertIn('Not reported', page.text)
 
     def test_saved_printer_is_reread_and_matched(self):
         calls=[]
@@ -378,8 +396,9 @@ class CoreTests(unittest.TestCase):
         with patch.object(printing,'cmd',fake_cmd), patch.object(printing,'discover_printer',lambda host: discovery):
             printing.retarget_saved_queues()
         self.assertIn(('lpadmin','-p','FadeFix','-E','-v','socket://192.168.1.20:9100','-m','drv:///brlaser.drv/brl2380d.ppd'),calls)
-        self.assertIn(('lpadmin','-p','FadeFix','-o','brlaserEconomode=False'),calls)
-        self.assertIn(('lpadmin','-p','FadeFix','-o','brlaserDensityAdjust=106'),calls)
+        self.assertIn(('lpadmin','-p','FadeFix','-o','brlaserEconomode=True'),calls)
+        self.assertIn(('lpadmin','-p','FadeFix','-o','brlaserDensityAdjust=102'),calls)
+        self.assertNotIn(('lpadmin','-p','FadeFix','-o','brlaserDensityAdjust=106'),calls)
         joined=' '.join(' '.join(args) for args in calls)
         self.assertNotIn('-m everywhere', joined)
         with store.connection() as db:
@@ -387,7 +406,7 @@ class CoreTests(unittest.TestCase):
             db.execute("DELETE FROM printers WHERE queue='FadeFix'")
         self.assertEqual(row['protocol'],'socket')
         self.assertEqual(row['identity'],'Brother HL-L2380DW series')
-        self.assertIn('Brother driver', row['driver'])
+        self.assertEqual(row['driver'],'Brother HL-L2380DW series, using brlaser v6.2.8')
 
     def test_failed_retarget_keeps_the_saved_protocol(self):
         def fake_cmd(*args, timeout=25):
@@ -401,6 +420,65 @@ class CoreTests(unittest.TestCase):
             row=db.execute("SELECT protocol FROM printers WHERE queue='Kept'").fetchone()
             db.execute("DELETE FROM printers WHERE queue='Kept'")
         self.assertEqual(row['protocol'],'ipp')
+
+    def test_driver_settings_are_named_and_can_be_changed(self):
+        listed='\n'.join([
+            'brlaserEconomode/Toner save mode: *True False',
+            'brlaserDensityAdjust/Toner Density: 94 100 *102 106',
+            'PageSize/Media Size: Letter *A4',
+        ])
+        parsed=printing.parse_queue_options(listed)
+        self.assertEqual(parsed[0]['key'],'brlaserEconomode')
+        self.assertEqual(parsed[0]['current'],'True')
+        self.assertEqual(parsed[1]['label'],'Toner Density')
+        self.assertEqual([item['current'] for item in parsed if item['key']=='brlaserDensityAdjust'],['102'])
+        calls=[]
+        def fake_cmd(*args, timeout=25):
+            calls.append(args)
+            stdout=listed if args[:2]==('lpoptions','-p') else ''
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+        discovery={
+            'reachable':True,'ipp':True,'socket':True,'make':'Brother',
+            'model':'HL-L2380DW series','identity':'Brother HL-L2380DW series','device_id':'',
+        }
+        drivers=[{
+            'name':'drv:///brlaser.drv/brl2380d.ppd',
+            'make-and-model':'Brother HL-L2380DW series, using brlaser v6.2.8',
+            'device-id':'MFG:Brother;MDL:HL-L2380DW series;',
+        }]
+        with patch.object(printing,'cmd',fake_cmd):
+            choice=printing.configure_queue('SetQ','192.0.2.44',discovery,drivers)
+        self.assertEqual(choice['driver'],'Brother HL-L2380DW series, using brlaser v6.2.8')
+        self.assertIn(('lpadmin','-p','SetQ','-o','brlaserEconomode=False'),calls)
+        self.assertIn(('lpadmin','-p','SetQ','-o','brlaserDensityAdjust=106'),calls)
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='SetQ'")
+            db.execute("INSERT INTO printers(queue,label,host,protocol,identity,driver) VALUES('SetQ','Office Printer','192.0.2.44','socket','Brother HL-L2380DW series','Brother HL-L2380DW series, using brlaser v6.2.8')")
+        sample={
+            'state':'Idle','reasons':[],'pages':10,'pages_label':'10',
+            'supplies':[{'name':'Black Toner','percent':50}],'serial':'','firmware':'',
+        }
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=sample), patch.object(printing,'cmd',fake_cmd), patch.object(printing,'cups_printers',return_value={'ok':True,'lines':[],'error':''}):
+            with TestClient(app) as client:
+                client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+                page=client.get('/?page=printers')
+                self.assertIn('Brother HL-L2380DW series, using brlaser v6.2.8', page.text)
+                self.assertIn('Driver settings', page.text)
+                self.assertIn('name="opt_brlaserDensityAdjust"', page.text)
+                self.assertIn('Toner save mode', page.text)
+                token=re.search(r'name="token" value="([^"]+)"', page.text).group(1)
+                calls.clear()
+                saved=client.post('/printers/options', data={
+                    'token':token,'queue':'SetQ',
+                    'opt_brlaserEconomode':'False','opt_brlaserDensityAdjust':'100',
+                }, follow_redirects=False)
+        self.assertEqual(saved.status_code,303)
+        self.assertIn(('lpadmin','-p','SetQ','-o','brlaserEconomode=False'),calls)
+        self.assertIn(('lpadmin','-p','SetQ','-o','brlaserDensityAdjust=100'),calls)
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='SetQ'")
 
     def test_printer_name_changes_without_rereading(self):
         with store.connection() as db:
@@ -449,7 +527,12 @@ class CoreTests(unittest.TestCase):
         from app.main import app
         with TestClient(app) as client:
             self.assertEqual(client.get('/',follow_redirects=False).status_code,303)
-            self.assertEqual(client.get('/login').status_code,200)
+            login=client.get('/login')
+            self.assertEqual(login.status_code,200)
+            self.assertIn('/static/favicon.svg', login.text)
+            icon=client.get('/static/favicon.svg')
+            self.assertEqual(icon.status_code,200)
+            self.assertIn(b'<svg', icon.content)
             self.assertEqual(client.post('/login',data={'username':'admin','password':'wrong'},follow_redirects=False).status_code,303)
             good=client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
             self.assertEqual(good.status_code,303)
@@ -462,7 +545,7 @@ class CoreTests(unittest.TestCase):
                 ('/?page=overview','Quick print'),
                 ('/?page=printers','Add a printer'),
                 ('/?page=jobs','Job log'),
-                ('/?page=email','Approved sender emails'),
+                ('/?page=email','Allowed senders'),
                 ('/?page=tailscale','Join this container to your tailnet'),
             ):
                 body=client.get(path)
@@ -473,6 +556,37 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(bye.status_code,303)
             self.assertIn('/login',bye.headers['location'])
             self.assertEqual(client.get('/',follow_redirects=False).status_code,303)
+
+    def test_tailscale_notice_closes_until_the_next_sign_in(self):
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with TestClient(app) as client:
+            denied=client.post('/tailscale/dismiss', data={'token':'x','page':'overview'}, follow_redirects=False)
+            self.assertEqual(denied.status_code,303)
+            self.assertIn('/login', denied.headers['location'])
+            client.post('/login', data={'username':'admin','password':os.environ['ADMIN_PASSWORD']}, follow_redirects=False)
+            first=client.get('/')
+            self.assertIn('No tailnet address', first.text)
+            self.assertIn('Dismiss Tailscale notice', first.text)
+            token=re.search(r'name="token" value="([^"]+)"', first.text).group(1)
+            closed=client.post('/tailscale/dismiss', data={'token':token,'page':'printers'}, follow_redirects=False)
+            self.assertEqual(closed.status_code,303)
+            self.assertIn('page=printers', closed.headers['location'])
+            again=client.get('/?page=printers')
+            self.assertNotIn('No tailnet address', again.text)
+            self.assertNotIn('Dismiss Tailscale notice', again.text)
+            other=client.get('/')
+            self.assertNotIn('Dismiss Tailscale notice', other.text)
+            signed=re.search(r'name="token" value="([^"]+)"', again.text).group(1)
+            client.post('/logout', data={'token':signed}, follow_redirects=False)
+            client.post('/login', data={'username':'admin','password':os.environ['ADMIN_PASSWORD']}, follow_redirects=False)
+            fresh=client.get('/')
+            self.assertIn('Dismiss Tailscale notice', fresh.text)
+            online={'state':'Running','ip':'100.64.0.8','hostname':'printharbor','online':True,'installed':True,'tun':True,'detail':''}
+            with patch('app.tailnet.status', return_value=online):
+                connected=client.get('/')
+            self.assertIn('100.64.0.8', connected.text)
+            self.assertNotIn('Dismiss Tailscale notice', connected.text)
 
     def test_unauthenticated_actions_redirect(self):
         from fastapi.testclient import TestClient
@@ -727,19 +841,21 @@ class CoreTests(unittest.TestCase):
     def test_disabled_badge_points_at_this_page(self):
         store.set_setting('mail_enabled','0')
         mailer.check_once()
-        self.assertEqual(mailer.snapshot()['detail'], 'Turn on automatic email printing below, then save.')
+        self.assertEqual(mailer.snapshot()['detail'], 'Turn on email printing, then save.')
         from fastapi.testclient import TestClient
         from app.main import app
         with TestClient(app) as client:
             client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
             page=client.get('/?page=email')
-            self.assertIn('Turn on automatic email printing below, then save.', page.text)
-            self.assertIn('Enable automatic email printing', page.text)
-            self.assertIn('Leave blank to accept mail from any sender', page.text)
-            self.assertIn('Leave blank to accept any To or Cc', page.text)
-            self.assertIn('Leave blank to require no PIN', page.text)
+            self.assertIn('Turn on email printing, then save.', page.text)
+            self.assertIn('Enable email printing', page.text)
+            self.assertIn('Blank accepts any sender', page.text)
+            self.assertIn('Blank accepts any To or Cc', page.text)
+            self.assertIn('Blank means no PIN', page.text)
             self.assertIn('Mail already in the folder is left alone', page.text)
-            self.assertLess(page.text.find('Enable automatic email printing'), page.text.find('IMAP server'))
+            self.assertNotIn('Event log', page.text)
+            self.assertNotIn('What is enforced', page.text)
+            self.assertLess(page.text.find('Enable email printing'), page.text.find('IMAP server'))
 
     def test_folder_decoding_and_list_does_not_save(self):
         self.assertEqual(mailer.decode_imap_utf7('INBOX'), 'INBOX')
@@ -930,5 +1046,260 @@ class CoreTests(unittest.TestCase):
             mailer.STOP.set()
         self.assertTrue(any(item.endswith(b'IDLE\r\n') for item in conn.sent))
         self.assertIn(b'DONE\r\n', conn.sent)
+
+    def _png(self):
+        from io import BytesIO
+        from PIL import Image
+        buf=BytesIO()
+        Image.new('RGB',(8,8),(20,40,60)).save(buf,'PNG')
+        return buf.getvalue()
+
+    def _reset_images(self):
+        images._index['mtime']=None
+        images._index['entries']=[]
+        path=images.fingerprint_file()
+        if path.exists():
+            path.unlink()
+        with store.connection() as db:
+            db.execute('DELETE FROM image_catalog')
+
+    def _enable_images(self):
+        os.environ['PRINTHARBOR_IMAGE_NETWORK']='1'
+        images.STOP.set()
+
+    def _disable_images(self):
+        os.environ['PRINTHARBOR_IMAGE_NETWORK']='0'
+        images.STOP.set()
+
+    def test_model_names_normalize_and_do_not_cross_nearby_codes(self):
+        brother=[images.identify(text)['code'] for text in (
+            'Brother HL-L2350DW series','Brother HL L2350DW','HL-L2350DW','Brother Industries HL-L2350DW',
+        )]
+        self.assertEqual(brother, ['hll2350dw']*4)
+        self.assertNotEqual(images.identify('HL-L2370DW')['code'], 'hll2350dw')
+        hp=images.identify('HP LaserJet Pro M404dn')
+        self.assertEqual(hp['manufacturer'], 'hp')
+        self.assertEqual(hp['code'], images.identify('Hewlett-Packard LaserJet Pro M404dn')['code'])
+        self.assertEqual(hp['code'], 'm404dn')
+        self.assertEqual(hp['category'], 'mono')
+        epson=images.identify('Epson EcoTank ET-2800')
+        self.assertEqual(epson['code'], images.identify('Epson ET 2800')['code'])
+        self.assertEqual(epson['code'], 'et2800')
+        self.assertEqual(epson['category'], 'inkjet')
+        canon=images.identify('Canon PIXMA TS3522')
+        self.assertEqual(canon['code'], images.identify('Canon TS-3522')['code'])
+        self.assertEqual(canon['code'], 'ts3522')
+        self.assertEqual(canon['category'], 'inkjet')
+        entries=[
+            {'id':'3952','name':'Brother HL-L2350DW'},
+            {'id':'3953','name':'Brother HL-L2370DW'},
+        ]
+        found=images.match_entries(entries, images.identify('Brother HL-L2350DW series'))
+        self.assertEqual(found['match']['id'], '3952')
+        self.assertGreaterEqual(found['confidence'], 0.9)
+        other=images.match_entries(entries, images.identify('HL-L2370DW'))
+        self.assertEqual(other['match']['id'], '3953')
+        self.assertFalse(any(item['id']=='3952' for item in other['candidates']))
+        near=images.match_entries(
+            [{'id':'1','name':'HP LaserJet Pro M404n'},{'id':'2','name':'HP LaserJet Pro M404dn'}],
+            images.identify('HP LaserJet Pro M404'),
+        )
+        self.assertIsNone(near['match'])
+        self.assertGreaterEqual(len(near['candidates']), 1)
+
+    def test_image_providers_cache_fallbacks_and_overrides(self):
+        self._reset_images()
+        self._enable_images()
+        png=self._png()
+        calls=[]
+
+        def fake(url, timeout=8, limit=2_000_000):
+            calls.append(url)
+            if 'fingerprint-database.json' in url:
+                return json.dumps({
+                    '3952':'Brother HL-L2350DW',
+                    '3953':'Brother HL-L2370DW',
+                }).encode(), 'application/json'
+            if 'static.ui.com' in url and '3952' in url:
+                return png, 'image/png'
+            if 'commons.wikimedia.org' in url:
+                return json.dumps({'query':{'pages':{}}}).encode(), 'application/json'
+            raise images.ImageError('unexpected address')
+
+        try:
+            with patch('app.images.fetch', side_effect=fake):
+                first=images.resolve_model(images.identify('Brother HL-L2350DW series'), force=True)
+                self.assertEqual(first['source'], 'unifi')
+                self.assertEqual(first['fingerprint_id'], '3952')
+                self.assertGreaterEqual(first['confidence'], 0.9)
+                self.assertTrue(Path(first['local_path']).is_file())
+                used=len(calls)
+                second=images.resolve_model(images.identify('HL-L2350DW'))
+                self.assertEqual(len(calls), used)
+                self.assertEqual(second['local_path'], first['local_path'])
+                with store.connection() as db:
+                    db.execute("INSERT INTO printers(queue,label,host,protocol,identity) VALUES('ImgA','A','192.0.2.50','socket','Brother HL-L2350DW series')")
+                    db.execute("INSERT INTO printers(queue,label,host,protocol,identity) VALUES('ImgB','B','192.0.2.51','socket','Brother HL-L2350DW')")
+                images.resolve_printer('ImgA')
+                after=len(calls)
+                images.resolve_printer('ImgB')
+                self.assertEqual(len(calls), after)
+
+                self._reset_images()
+                calls.clear()
+                unknown=images.resolve_model(images.identify('Mystery ZX9000'), force=True)
+                self.assertEqual(unknown['source'], 'miss')
+                self.assertEqual(unknown['category'], 'generic')
+                self.assertTrue(unknown['negative_until'])
+                quiet=len(calls)
+                again=images.resolve_model(images.identify('Mystery ZX9000'))
+                self.assertEqual(len(calls), quiet)
+                self.assertEqual(again['source'], 'miss')
+                with store.connection() as db:
+                    db.execute("INSERT INTO printers(queue,label,host,protocol,identity) VALUES('ImgU','U','192.0.2.52','socket','Mystery ZX9000')")
+                path, media=images.file_for('ImgU')
+                self.assertEqual(media, 'image/svg+xml')
+                self.assertTrue(str(path).endswith('generic.svg'))
+
+                self._reset_images()
+                calls.clear()
+
+                def broken(url, timeout=8, limit=2_000_000):
+                    calls.append(url)
+                    if 'fingerprint-database.json' in url:
+                        return json.dumps({'3952':'Brother HL-L2350DW'}).encode(), 'application/json'
+                    if 'static.ui.com' in url:
+                        return b'<html>nope</html>', 'text/html'
+                    return json.dumps({'query':{'pages':{}}}).encode(), 'application/json'
+
+                with patch('app.images.fetch', side_effect=broken):
+                    rejected=images.resolve_model(images.identify('Brother HL-L2350DW series'), force=True)
+                self.assertEqual(rejected['source'], 'miss')
+                self.assertFalse(rejected['local_path'])
+                self.assertTrue(any('static.ui.com' in url for url in calls))
+                self.assertTrue(any('commons.wikimedia.org' in url for url in calls))
+
+                self._reset_images()
+                calls.clear()
+
+                def slow(url, timeout=8, limit=2_000_000):
+                    calls.append(url)
+                    if 'fingerprint-database.json' in url:
+                        return json.dumps({'3952':'Brother HL-L2350DW'}).encode(), 'application/json'
+                    raise TimeoutError('slow')
+
+                with patch('app.images.fetch', side_effect=slow):
+                    timed=images.resolve_model(images.identify('Brother HL-L2350DW series'), force=True)
+                self.assertEqual(timed['source'], 'miss')
+                self.assertTrue(any('static.ui.com' in url for url in calls))
+                self.assertTrue(any('commons.wikimedia.org' in url for url in calls))
+                with store.connection() as db:
+                    db.execute("INSERT INTO printers(queue,label,host,protocol,identity) VALUES('ImgOff','Off','192.0.2.53','socket','Brother HL-L2350DW series')")
+                offline, offline_type=images.file_for('ImgOff')
+                self.assertEqual(offline_type, 'image/svg+xml')
+                self.assertTrue(offline.is_file())
+
+                kept=images._cache_file('brother|hll2350dw')
+                kept.write_bytes(png)
+                images._save_catalog({
+                    'model_key':'brother|hll2350dw','manufacturer':'brother','model':'hll2350dw','source':'unifi',
+                    'fingerprint_id':'3952','local_path':str(kept),'confidence':1,'license':'','attribution':'Ubiquiti',
+                    'source_page':'','checked_at':'','negative_until':'','category':'mono','candidates':'[]',
+                })
+                before=kept.read_bytes()
+                with patch('app.images.fetch', side_effect=TimeoutError('down')):
+                    held=images.resolve_model(images.identify('Brother HL-L2350DW series'), force=True)
+                self.assertEqual(held['local_path'], str(kept))
+                self.assertEqual(kept.read_bytes(), before)
+
+                self._reset_images()
+                pages=[
+                    {'title':'File:Brother logo.jpg','license':'CC BY 4.0','url':'https://upload.wikimedia.org/logo.jpg','artist':'','page':'','mime':'image/jpeg'},
+                    {'title':'File:Brother HL-L2370DW.jpg','license':'CC BY 4.0','url':'https://upload.wikimedia.org/near.jpg','artist':'','page':'','mime':'image/jpeg'},
+                    {'title':'File:Brother HL-L2350DW screenshot.jpg','license':'CC BY 4.0','url':'https://upload.wikimedia.org/shot.jpg','artist':'','page':'','mime':'image/jpeg'},
+                    {'title':'File:Brother HL-L2350DW.jpg','license':'CC BY-NC 4.0','url':'https://upload.wikimedia.org/nc.jpg','artist':'','page':'','mime':'image/jpeg'},
+                    {'title':'File:Brother HL-L2350DW front.jpg','license':'CC BY-SA 4.0','url':'https://upload.wikimedia.org/good.jpg','artist':'Ada','page':'https://commons.wikimedia.org/wiki/File:Brother_HL-L2350DW_front.jpg','mime':'image/jpeg'},
+                ]
+                self.assertIsNone(images.pick_wiki(pages[:4], 'hll2350dw'))
+                self.assertEqual(images.pick_wiki(pages, 'hll2350dw')['title'], 'File:Brother HL-L2350DW front.jpg')
+                self.assertFalse(images.license_ok('CC BY-ND 2.0'))
+                self.assertTrue(images.license_ok('Public domain'))
+
+                def commons(url, timeout=8, limit=2_000_000):
+                    if 'fingerprint-database.json' in url:
+                        return b'{"1":"Unrelated QQ11"}', 'application/json'
+                    if 'commons.wikimedia.org/w/api.php' in url:
+                        return json.dumps({'query':{'pages':{'1':{
+                            'title':'File:Brother HL-L2350DW front.jpg',
+                            'imageinfo':[{
+                                'thumburl':'https://upload.wikimedia.org/good.jpg',
+                                'descriptionurl':'https://commons.wikimedia.org/wiki/File:Brother_HL-L2350DW_front.jpg',
+                                'mime':'image/jpeg',
+                                'extmetadata':{
+                                    'LicenseShortName':{'value':'CC BY-SA 4.0'},
+                                    'Artist':{'value':'<a href="https://example.com">Ada</a>'},
+                                },
+                            }],
+                        }}}}).encode(), 'application/json'
+                    if url=='https://upload.wikimedia.org/good.jpg':
+                        return png, 'image/jpeg'
+                    return b'<html>rejected</html>', 'text/html'
+
+                with patch('app.images.fetch', side_effect=commons):
+                    wiki=images.resolve_model(images.identify('Brother HL-L2350DW series'), force=True)
+                self.assertEqual(wiki['source'], 'wikimedia')
+                self.assertEqual(wiki['license'], 'CC BY-SA 4.0')
+                self.assertEqual(wiki['attribution'], 'Ada')
+                self.assertIn('commons.wikimedia.org', wiki['source_page'])
+
+                catalog=images.fingerprint_file()
+                catalog.write_bytes(b'{"3952":"Brother HL-L2350DW"}')
+                with patch('app.images.fetch', side_effect=TimeoutError('refresh failed')):
+                    self.assertTrue(images.refresh_fingerprint(force=True))
+                self.assertEqual(catalog.read_bytes(), b'{"3952":"Brother HL-L2350DW"}')
+
+                with store.connection() as db:
+                    db.execute("INSERT INTO printers(queue,label,host,protocol,identity) VALUES('ImgM','Mine','192.0.2.54','socket','Brother HL-L2350DW series')")
+                images.save_upload('ImgM','mine.png',png)
+                images.apply_preview('ImgM')
+                saved=Path(images._printer('ImgM')['image_path'])
+                original=saved.read_bytes()
+                with patch('app.images.fetch', side_effect=images.ImageError('down')):
+                    images.rescan_all()
+                row=images._printer('ImgM')
+                self.assertEqual(row['image_mode'], 'manual')
+                self.assertEqual(Path(row['image_path']).read_bytes(), original)
+                with self.assertRaises(images.ImageError):
+                    images.save_upload('ImgM','bad.svg',b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
+                with self.assertRaises(images.ImageError):
+                    images.save_upload('ImgM','bad.png',b'not an image')
+                with patch('app.images.urlopen', side_effect=AssertionError('network')):
+                    with self.assertRaises(images.ImageError):
+                        images.fetch('http://static.ui.com/fingerprint/0/1_257x257.png')
+                    with self.assertRaises(images.ImageError):
+                        images.fetch('https://example.com/printer.png')
+        finally:
+            self._disable_images()
+
+    def test_printer_image_page_uses_a_local_picture(self):
+        with store.connection() as db:
+            db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol,identity) VALUES('ImgPage','Office Printer','192.0.2.55','socket','Brother HL-L2350DW series')")
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with patch.object(printing,'printer_reachable',return_value=False), patch.object(printing,'cups_printers',return_value={'ok':True,'lines':[],'error':''}):
+            with TestClient(app) as client:
+                blocked=client.get('/printer-images/ImgPage', follow_redirects=False)
+                self.assertEqual(blocked.status_code, 303)
+                client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+                page=client.get('/?page=printers')
+                self.assertEqual(page.status_code, 200)
+                self.assertIn('printer-photo', page.text)
+                self.assertIn('Change printer image', page.text)
+                self.assertIn('Printer images', page.text)
+                self.assertNotIn('printer-figure', page.text)
+                picture=client.get('/printer-images/ImgPage')
+                self.assertEqual(picture.status_code, 200)
+                self.assertEqual(picture.headers['content-type'].split(';',1)[0], 'image/svg+xml')
+                self.assertIn(b'<svg', picture.content)
 
 if __name__=='__main__': unittest.main()

@@ -464,7 +464,7 @@ def fallback_wait(config):
 
 def ready(config):
     if config.get('mail_enabled') != '1':
-        publish(state='Disabled', detail='Turn on automatic email printing below, then save.')
+        publish(state='Disabled', detail='Turn on email printing, then save.')
         return False
     if not all([
         config.get('imap_host'), config.get('imap_user'), config.get('imap_password'),
