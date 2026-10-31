@@ -7,12 +7,15 @@ import socket
 import subprocess
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError
 from pypdf import PdfReader, PdfWriter
+from reportlab.lib.colors import HexColor, white
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
+from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen.canvas import Canvas
 from . import store
 
@@ -31,6 +34,8 @@ class PrintError(Exception):
 STOP = threading.Event()
 _QUEUE_LOCKS = {}
 _QUEUE_LOCKS_GUARD = threading.Lock()
+_NOTICE_AT = {}
+LOW_SUPPLY = 10
 
 def cmd(*args, timeout=25):
     env = os.environ.copy()
@@ -167,6 +172,7 @@ IPP_FIELDS = (
     'printer-make-and-model', 'printer-device-id', 'printer-state', 'printer-state-reasons',
     'printer-is-accepting-jobs', 'marker-names', 'marker-levels', 'marker-high-levels',
     'printer-firmware-string', 'printer-firmware-name', 'printer-firmware-version',
+    'printer-icons',
 )
 
 def _ipp_request(host, detailed=False):
@@ -676,6 +682,177 @@ def prepare_bytes(filename, data, max_pages):
             dest.unlink(missing_ok=True)
         raise
 
+def _supply_kind(name):
+    low = (name or '').lower()
+    if any(word in low for word in ('drum', 'opc', 'imaging', 'photoconductor')):
+        return 'drum'
+    if 'waste' in low:
+        return ''
+    if 'ink' in low:
+        return 'ink'
+    if any(word in low for word in ('toner', 'cartridge')):
+        return 'toner'
+    return ''
+
+
+def supply_problem(stats):
+    """A sentence when ink, toner, or drum is at 10% or below, paper is empty, or the printer is jammed."""
+    if not stats:
+        return None
+    problems = []
+    saw_mark = False
+    for item in stats.get('supplies') or []:
+        kind = _supply_kind(item.get('name') or '')
+        percent = item.get('percent')
+        if not kind or not isinstance(percent, int):
+            continue
+        if percent > LOW_SUPPLY:
+            continue
+        saw_mark = True
+        label = ' '.join(str(item.get('name') or kind).split())
+        problems.append(f'{label} is at {percent}%')
+    reasons = [str(item) for item in (stats.get('reasons') or [])]
+    if not saw_mark and 'Toner empty' in reasons:
+        problems.append('The toner is empty')
+    if any(item in reasons for item in ('Out of paper', 'Paper needed')):
+        problems.append('The printer is out of paper')
+    if 'Paper jam' in reasons:
+        problems.append('The printer has a paper jam')
+    if not problems:
+        return None
+    state = condition(stats, online=True)
+    reason = '. '.join(problems)
+    if not reason.endswith('.'):
+        reason += '.'
+    reason += ' The document was not printed.'
+    return {
+        'reason': reason,
+        'problems': problems,
+        'notice': state['paper'] != 'empty' and state['jam'] != 'jam',
+    }
+
+
+def supply_hold(queue):
+    """Read the printer. None when it did not report a supply fault."""
+    if not QUEUE_RE.fullmatch(queue or ''):
+        return None
+    with store.connection() as db:
+        printer = db.execute(
+            'SELECT host, protocol, label, identity FROM printers WHERE queue=?',
+            (queue,),
+        ).fetchone()
+    if not printer or not printer_reachable(printer['host'], printer['protocol'], timeout=1):
+        return None
+    try:
+        stats = printer_stats(printer['host'])
+    except Exception:
+        return None
+    problem = supply_problem(stats)
+    if not problem:
+        return None
+    problem['label'] = (printer['label'] or queue)[:100]
+    problem['identity'] = printer['identity'] or printer['label'] or ''
+    return problem
+
+
+def _wrap_line(text, font, size, width):
+    lines = []
+    current = ''
+    for word in str(text or '').split():
+        trial = word if not current else f'{current} {word}'
+        if stringWidth(trial, font, size) <= width:
+            current = trial
+        else:
+            if current:
+                lines.append(current)
+            current = word
+    if current:
+        lines.append(current)
+    return lines or ['']
+
+
+def _notice_pdf(dest, hold):
+    canvas = Canvas(str(dest), pagesize=letter)
+    width, height = letter
+    canvas.setFillColor(HexColor('#17191f'))
+    canvas.rect(0, height - 96, width, 96, fill=1, stroke=0)
+    canvas.setFillColor(white)
+    canvas.setFont('Helvetica-Bold', 13)
+    canvas.drawString(48, height - 42, 'PRINT HARBOR')
+    canvas.setFont('Helvetica', 12)
+    canvas.drawString(48, height - 66, 'This document was not printed')
+    canvas.setFillColor(HexColor('#17191f'))
+    y = height - 146
+    canvas.setFont('Helvetica-Bold', 22)
+    for line in _wrap_line(hold.get('reason') or 'The printer needs attention.', 'Helvetica-Bold', 22, width - 96)[:5]:
+        canvas.drawString(48, y, line)
+        y -= 30
+    y -= 10
+    canvas.setFont('Helvetica', 13)
+    canvas.setFillColor(HexColor('#5c6570'))
+    canvas.drawString(48, y, 'PRINTER')
+    y -= 22
+    canvas.setFillColor(HexColor('#17191f'))
+    canvas.setFont('Helvetica-Bold', 16)
+    canvas.drawString(48, y, (hold.get('label') or 'Printer')[:80])
+    y -= 42
+    canvas.setFont('Helvetica-Bold', 13)
+    canvas.drawString(48, y, 'WHAT TO DO')
+    y -= 28
+    canvas.setFont('Helvetica', 13)
+    steps = [
+        'Fix the printer. Replace anything at or below 10%, add paper, or clear a jam.',
+        'Send the document again.',
+    ]
+    try:
+        from . import supplies
+        cartridge = supplies.replacement_for(hold.get('identity') or '')
+    except Exception:
+        cartridge = None
+    if cartridge and cartridge.get('name'):
+        steps.insert(1, f"The cartridge for this model is {cartridge['name']}.")
+    for index, step in enumerate(steps, start=1):
+        canvas.setFont('Helvetica-Bold', 13)
+        canvas.drawString(48, y, f'{index:02d}')
+        canvas.setFont('Helvetica', 13)
+        wrapped = _wrap_line(step, 'Helvetica', 13, width - 120)
+        for line_index, line in enumerate(wrapped[:3]):
+            canvas.drawString(88, y - (line_index * 18), line)
+        y -= 18 * max(len(wrapped[:3]), 1) + 14
+    canvas.setFillColor(HexColor('#5c6570'))
+    canvas.setFont('Helvetica', 10)
+    canvas.drawString(48, 48, 'Print Harbor')
+    canvas.save()
+
+
+def print_supply_notice(queue, hold):
+    """Print one notice while the same fault continues, and only when a page can still come out."""
+    if not hold or not hold.get('notice') or not QUEUE_RE.fullmatch(queue or ''):
+        return False
+    signature = hold.get('reason') or ''
+    now = time.time()
+    previous = _NOTICE_AT.get(queue)
+    if previous and previous[0] == signature and now - previous[1] < 6 * 3600:
+        return False
+    folder = store.ROOT / 'tmp'
+    folder.mkdir(parents=True, exist_ok=True)
+    path = folder / f'notice-{uuid.uuid4().hex}.pdf'
+    try:
+        _notice_pdf(path, hold)
+        result = cmd('lp', '-d', queue, '-n', '1', '-o', 'sides=one-sided', str(path), timeout=35)
+    except Exception:
+        store.event('warning', 'The supply notice could not be printed')
+        return False
+    finally:
+        path.unlink(missing_ok=True)
+    if result.returncode:
+        store.event('warning', 'The supply notice could not be printed')
+        return False
+    _NOTICE_AT[queue] = (signature, now)
+    store.event('info', f'Printed a supply notice for {queue}')
+    return True
+
+
 def record_rejection(filename, reason, queue='', source='email', sender='', dedupe=None, copies=1, sides='one-sided'):
     """Keep a received print in the job log when it is turned down before CUPS."""
     name = ' '.join(str(filename or 'Email').split())[:180] or 'Email'
@@ -720,6 +897,14 @@ def submit_file(filename, data, queue, copies=1, sides='one-sided', source='uplo
     if not configured:
         record_rejection(safe_name, 'Printer not configured', queue, source, sender, dedupe, copies, sides)
         raise PrintError('Printer not configured')
+    hold = supply_hold(queue)
+    if hold:
+        record_rejection(safe_name, hold['reason'], queue, source, sender, dedupe, copies, sides)
+        try:
+            print_supply_notice(queue, hold)
+        except Exception:
+            store.event('warning', 'The supply notice could not be printed')
+        raise PrintError(hold['reason'])
     with store.connection() as db:
         if dedupe:
             existing = db.execute('SELECT id, status FROM jobs WHERE dedupe=?', (dedupe,)).fetchone()

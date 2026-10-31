@@ -1282,6 +1282,7 @@ class CoreTests(unittest.TestCase):
             self._disable_images()
 
     def test_printer_image_page_uses_a_local_picture(self):
+        self._reset_images()
         with store.connection() as db:
             db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol,identity) VALUES('ImgPage','Office Printer','192.0.2.55','socket','Brother HL-L2350DW series')")
         from fastapi.testclient import TestClient
@@ -1295,11 +1296,153 @@ class CoreTests(unittest.TestCase):
                 self.assertEqual(page.status_code, 200)
                 self.assertIn('printer-photo', page.text)
                 self.assertIn('Change printer image', page.text)
-                self.assertIn('Printer images', page.text)
+                self.assertNotIn('Identify printer images automatically', page.text)
+                self.assertNotIn('Use the UniFi device catalog', page.text)
                 self.assertNotIn('printer-figure', page.text)
                 picture=client.get('/printer-images/ImgPage')
                 self.assertEqual(picture.status_code, 200)
                 self.assertEqual(picture.headers['content-type'].split(';',1)[0], 'image/svg+xml')
                 self.assertIn(b'<svg', picture.content)
+
+    def test_supply_faults_reject_the_document(self):
+        fine={'reasons':[],'supplies':[{'name':'Black Toner','percent':11},{'name':'Waste Toner','percent':0}]}
+        self.assertIsNone(printing.supply_problem(fine))
+        low=printing.supply_problem({'reasons':[],'supplies':[{'name':'Black Toner','percent':8},{'name':'Drum Unit','percent':10}]})
+        self.assertIn('Black Toner is at 8%', low['reason'])
+        self.assertIn('Drum Unit is at 10%', low['reason'])
+        self.assertIn('not printed', low['reason'])
+        self.assertTrue(low['notice'])
+        empty=printing.supply_problem({'reasons':['Out of paper'],'supplies':[{'name':'Black Toner','percent':40}]})
+        self.assertIn('out of paper', empty['reason'])
+        self.assertFalse(empty['notice'])
+        jammed=printing.supply_problem({'reasons':['Paper jam'],'supplies':[{'name':'Cyan Ink','percent':4}]})
+        self.assertIn('paper jam', jammed['reason'])
+        self.assertFalse(jammed['notice'])
+        self.assertIn('Cyan Ink is at 4%', jammed['reason'])
+
+        with store.connection() as db:
+            db.execute("INSERT OR REPLACE INTO printers(queue,label,host,protocol,identity) VALUES('LowQ','Office Printer','192.0.2.70','socket','Brother HL-L2380DW series')")
+        printing._NOTICE_AT.pop('LowQ', None)
+        calls=[]
+
+        def fake_cmd(*args, **kwargs):
+            calls.append(args)
+            return SimpleNamespace(returncode=0, stdout='request id is LowQ-1 (1 file(s))', stderr='')
+
+        stats={'state':'Idle','reasons':[],'pages':None,'supplies':[{'name':'Black Toner','percent':8}],'serial':'','firmware':''}
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=stats), patch.object(printing,'cmd',side_effect=fake_cmd):
+            with self.assertRaises(printing.PrintError) as caught:
+                printing.submit_file('note.pdf', b'%PDF-1.4', 'LowQ', source='email', sender='person@example.com', dedupe='low-1')
+            with self.assertRaises(printing.PrintError):
+                printing.submit_file('again.pdf', b'%PDF-1.4', 'LowQ', source='email', sender='person@example.com', dedupe='low-2')
+        self.assertIn('8%', str(caught.exception))
+        self.assertEqual(len(calls), 1)
+        self.assertTrue(str(calls[0][-1]).find('notice-') >= 0)
+        with store.connection() as db:
+            row=db.execute("SELECT status, error FROM jobs WHERE dedupe='low-1'").fetchone()
+        self.assertEqual(row['status'], 'rejected')
+        self.assertIn('8%', row['error'])
+
+        calls.clear()
+        printing._NOTICE_AT.pop('LowQ', None)
+        blocked={'state':'Idle','reasons':['Out of paper'],'pages':None,'supplies':[{'name':'Black Toner','percent':40}],'serial':'','firmware':''}
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=blocked), patch.object(printing,'cmd',side_effect=fake_cmd):
+            with self.assertRaises(printing.PrintError) as paper:
+                printing.submit_file('paper.pdf', b'%PDF-1.4', 'LowQ', dedupe='low-paper')
+        self.assertIn('out of paper', str(paper.exception))
+        self.assertEqual(calls, [])
+
+        msg=EmailMessage()
+        msg['From']='person@example.com'
+        msg['Subject']='PRINT'
+        msg.set_content('file')
+        msg.add_attachment(b'%PDF-1.4', maintype='application', subtype='pdf', filename='note.pdf')
+        cfg={'allowed_senders':'','mail_recipient':'','email_pin':'','default_sides':'one-sided','max_files':'5','default_queue':'LowQ','print_email_body':'0'}
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=stats), patch.object(printing,'cmd',side_effect=fake_cmd):
+            result=mailer.handle_message(msg, 'low-mail', cfg)
+        self.assertEqual(result['jobs'], 0)
+        self.assertIn('8%', result['reason'])
+        html=mailer.render_reply(result)
+        self.assertIn('NOT PRINTED', html)
+        self.assertIn('8%', html)
+        self.assertIn('not printed', html.lower())
+
+    def test_result_email_includes_the_printer_photo(self):
+        self._reset_images()
+        png=self._png()
+        ident=images.identify('Brother HL-L2350DW series')
+        path=images._cache_file(ident['key'])
+        path.write_bytes(png)
+        images._save_catalog({
+            'model_key':ident['key'],'manufacturer':'brother','model':ident['code'],'source':'printer',
+            'fingerprint_id':'','local_path':str(path),'confidence':1,'license':'','attribution':'The printer',
+            'source_page':'','checked_at':'','negative_until':'','category':'mono','candidates':'[]',
+        })
+        with store.connection() as db:
+            db.execute("INSERT OR REPLACE INTO printers(queue,label,host,protocol,identity) VALUES('PhotoQ','Office Printer','192.0.2.71','socket','Brother HL-L2350DW series')")
+        data, subtype=images.email_bytes('PhotoQ')
+        self.assertEqual(subtype, 'png')
+        self.assertTrue(data.startswith(b'\x89PNG'))
+        msg=EmailMessage()
+        msg['From']='Person <person@example.com>'
+        msg['Subject']='PRINT'
+        msg['Message-ID']='<photo@example.com>'
+        config={
+            'reply_enabled':'1','smtp_from':'printme@example.com','imap_user':'devon@example.com',
+            'imap_password':'secret-pass','smtp_host':'smtp.gmail.com','smtp_port':'587',
+        }
+        result={'accepted':False,'jobs':0,'errors':0,'reason':'Black Toner is at 8%. The document was not printed.','queue':'PhotoQ','notes':[],'files':[]}
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                FakeSMTP.last=self
+            def ehlo(self):
+                return None
+            def starttls(self):
+                return None
+            def login(self, user, password):
+                return None
+            def send_message(self, message):
+                self.message=message
+            def quit(self):
+                return None
+
+        with patch('app.mailer.smtplib.SMTP', FakeSMTP):
+            mailer.notify_sender(msg, config, result)
+        sent=FakeSMTP.last.message
+        html=sent.get_body(preferencelist=('html',)).get_content()
+        plain=sent.get_body(preferencelist=('plain',)).get_content()
+        self.assertIn('cid:printer', html)
+        self.assertIn('8%', html)
+        self.assertIn('8%', plain)
+        self.assertTrue(any(part.get_content_type()=='image/png' for part in sent.walk()))
+
+    def test_device_icon_is_cached_for_the_model(self):
+        self._reset_images()
+        self._enable_images()
+        png=self._png()
+        with store.connection() as db:
+            db.execute("INSERT OR REPLACE INTO printers(queue,label,host,protocol,identity) VALUES('IconQ','Office','192.0.2.72','socket','Brother HL-L2350DW series')")
+
+        class Resp:
+            headers={'Content-Type':'image/png'}
+            def read(self, _limit):
+                return png
+            def geturl(self):
+                return 'http://192.0.2.72/icon.png'
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+
+        try:
+            with patch.object(printing,'ipp_attributes',return_value={'printer-icons':['http://192.0.2.72/icon.png']}), patch('app.images.urllib.request.build_opener') as build:
+                build.return_value.open.return_value=Resp()
+                row=images.resolve_printer('IconQ')
+            self.assertEqual(row['source'], 'printer')
+            self.assertTrue(Path(row['local_path']).is_file())
+            self.assertEqual(images.file_for('IconQ')[1], 'image/png')
+        finally:
+            self._disable_images()
 
 if __name__=='__main__': unittest.main()
