@@ -3,13 +3,26 @@
 {% set job_labels = {'pending':'Pending','sending':'Sending','submitted':'Sent','error':'Failed','rejected':'Rejected','cancelled':'Cancelled','preparing':'Preparing'} %}
 {% set job_class = {'pending':'wait','sending':'wait','submitted':'online','error':'offline','rejected':'warn','cancelled':'neutral','preparing':'neutral'} %}
 {% set tone = 'good' if mail.state=='Healthy' or mail.state=='Watching' else ('bad' if mail.state=='Error' else 'warn') %}
+{% macro supply_meters(stats) %}
+{% if stats and stats.supplies %}
+<div class="levels">
+  {% for supply in stats.supplies %}
+  {% set band = 'is-low' if supply.percent <= 15 else ('is-mid' if supply.percent <= 30 else '') %}
+  <div class="level">
+    <div class="level-top"><span>{{ supply.name }}</span><strong>{{ supply.percent }}%</strong></div>
+    <div class="level-track" role="meter" aria-valuenow="{{ supply.percent }}" aria-valuemin="0" aria-valuemax="100" aria-label="{{ supply.name }} level"><span class="level-fill {{ band }}" style="width: {{ supply.percent }}%"></span></div>
+  </div>
+  {% endfor %}
+</div>
+{% endif %}
+{% endmacro %}
 <!doctype html>
 <html lang="en">
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
-  <link rel="stylesheet" href="/static/style.css?v=5">
+  <link rel="stylesheet" href="/static/style.css?v=9">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
@@ -39,14 +52,14 @@
     {% if page=='overview' %}
       <div class="headerline"><div><h1>Overview</h1><p class="muted">Printers, jobs, and intake status.</p></div><a class="button subtle" href="/?page=email">Email automation <span aria-hidden="true">→</span></a></div>
       <div class="metrics">
-        <div class="metric"><span>Registered printers</span><strong>{{ counts.printers }}</strong><small>Configured CUPS destinations</small></div>
-        <div class="metric"><span>Sent jobs</span><strong>{{ counts.submitted }}</strong><small>{% if counts.pending %}{{ counts.pending }} waiting for a printer{% else %}Sent in the latest 100{% endif %}</small></div>
-        <div class="metric"><span>Attention needed</span><strong>{{ counts.errors }}</strong><small>Failed or rejected in the latest 100</small></div>
+        <div class="metric"><span>Registered printers</span><strong>{{ counts.printers }}</strong><small>Ready to print</small></div>
+        <div class="metric"><span>Sent jobs</span><strong>{{ counts.submitted }}</strong><small>{% if counts.pending %}{{ counts.pending }} waiting for a printer{% else %}Finished recently{% endif %}</small></div>
+        <div class="metric"><span>Attention needed</span><strong>{{ counts.errors }}</strong><small>Failed or rejected</small></div>
         <div class="metric"><span>Email automation</span><strong class="metric-word">{{ mail.state }}</strong><small>{% if mail.detail and mail.state != 'Healthy' %}{{ mail.detail }}{% else %}{{ mail.checked or 'Not checked yet' }}{% endif %}</small></div>
       </div>
       <div class="two-col">
         <section class="panel" aria-labelledby="quick-print-title">
-          <div class="panelhead"><div><h2 id="quick-print-title">Quick print</h2><p>Upload a document to a configured queue.</p></div><span class="chip">PDF, Office, images, text</span></div>
+          <div class="panelhead"><div><h2 id="quick-print-title">Quick print</h2><p>Upload a document to a configured queue.</p></div></div>
           {% if printers %}
           <form action="/jobs/upload" method="post" enctype="multipart/form-data" class="form-stack">
             <input type="hidden" name="token" value="{{ token }}">
@@ -63,11 +76,31 @@
           {% endif %}
         </section>
         <section class="panel" aria-labelledby="printer-status-title">
-          <div class="panelhead"><div><h2 id="printer-status-title">Printer status</h2><p>Shows whether this host can reach the printer.</p></div></div>
+          <div class="panelhead"><div><h2 id="printer-status-title">Printer status</h2><p>Toner, ink, and page count, read when this page opens.</p></div></div>
           {% if printers %}
-          <div class="printer-list">
+          <div class="dash-printers">
             {% for p in printers %}
-            <div class="printer-line"><div class="printer-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 14h12v7H6z"/></svg></div><div><strong>{{ p.label }}</strong><small>{{ p.identity or p.host }} · {{ p.queue }}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span></div>
+            {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
+            <article class="dash-printer">
+              <div class="dash-printer-head">
+                <div><strong>{{ p.label }}</strong><small>{{ p.identity or p.host }}</small></div>
+                <span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Online' if p.online else 'Offline') }}</span>
+              </div>
+              {% if p.stats and p.stats.reasons %}<p class="dash-alert">{{ p.stats.reasons|join(', ') }}</p>{% endif %}
+              {{ supply_meters(p.stats) }}
+              {% if p.online and p.stats and p.stats.pages_label %}<p class="dash-pages"><span>Pages printed</span><strong>{{ p.stats.pages_label }}</strong></p>{% endif %}
+              {% if not p.online %}
+              <p class="form-help">Levels show when the printer is online.</p>
+              {% elif not p.stats or not p.stats.supplies %}
+              <p class="form-help">This printer did not report a toner or ink level.</p>
+              {% endif %}
+              {% if p.supply %}
+              <div class="supply-link">
+                <span>{{ p.supply.kind }}{% if p.supply.name %} {{ p.supply.name }}{% endif %}</span>
+                <a href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer">Lowest price on Amazon</a>
+              </div>
+              {% endif %}
+            </article>
             {% endfor %}
           </div>
           {% else %}
@@ -92,11 +125,34 @@
       <div class="headerline"><div><h1>Printers</h1><p class="muted">Add a printer by its address. PrintHarbor reads it and selects a driver.</p></div></div>
       <div class="two-col">
         <section class="panel" aria-labelledby="destinations-title">
-          <div class="panelhead"><div><h2 id="destinations-title">Connected destinations</h2><p>{{ printers|length }} registered print {{ 'queue' if printers|length==1 else 'queues' }}.</p></div></div>
+          <div class="panelhead"><div><h2 id="destinations-title">Connected destinations</h2><p>Status, toner, and page count are read when this page opens.</p></div></div>
           {% if printers %}
           <div class="printer-list">
             {% for p in printers %}
-            <div class="printer-line expand"><div class="printer-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 14h12v7H6z"/></svg></div><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}{% if p.pages_total %} · {{ p.pages_total }} pages{% endif %}</small></div><span class="status {% if p.online %}online{% else %}offline{% endif %}">{{ 'Reachable' if p.online else 'Offline' }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
+            {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
+            <div class="printer-block">
+              <div class="printer-line expand"><div class="printer-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 14h12v7H6z"/></svg></div><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
+              {% if p.supply %}
+              <div class="supply-link">
+                <span>{{ p.supply.kind }}{% if p.supply.name %} {{ p.supply.name }}{% endif %}</span>
+                <a href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer">Lowest price on Amazon</a>
+                {% if p.supply.note %}<small>{{ p.supply.note }}</small>{% endif %}
+              </div>
+              {% endif %}
+              {% if p.online and p.stats and (p.stats.reasons or p.stats.pages_label or p.stats.supplies or p.stats.serial or p.stats.firmware) %}
+              {{ supply_meters(p.stats) }}
+              {% if p.stats.reasons or p.stats.pages_label or p.stats.serial or p.stats.firmware %}
+              <div class="printer-stats" aria-label="Readings for {{ p.label }}">
+                {% if p.stats.reasons %}<div><span>Needs attention</span><strong>{{ p.stats.reasons|join(', ') }}</strong></div>{% endif %}
+                {% if p.stats.pages_label %}<div><span>Pages printed</span><strong>{{ p.stats.pages_label }}</strong></div>{% endif %}
+                {% if p.stats.serial %}<div><span>Serial</span><strong>{{ p.stats.serial }}</strong></div>{% endif %}
+                {% if p.stats.firmware %}<div><span>Firmware</span><strong>{{ p.stats.firmware }}</strong></div>{% endif %}
+              </div>
+              {% endif %}
+              {% elif p.online %}
+              <p class="form-help printer-quiet">This printer did not report supplies or a page count.</p>
+              {% endif %}
+            </div>
             {% endfor %}
           </div>
           {% else %}
@@ -325,8 +381,8 @@
       {% endif %}
     </section>
     {% endif %}
-    <footer>PrintHarbor <span>Jobs stay on this host. CUPS acceptance is not a printed page.</span></footer>
   </div>
+  <footer>PrintHarbor <span>Jobs stay on this host. CUPS acceptance is not a printed page.</span></footer>
 </main>
 </div>
 </body>
