@@ -3,18 +3,58 @@
 {% set job_labels = {'pending':'Pending','sending':'Sending','submitted':'Sent','error':'Failed','rejected':'Rejected','cancelled':'Cancelled','preparing':'Preparing'} %}
 {% set job_class = {'pending':'wait','sending':'wait','submitted':'online','error':'offline','rejected':'warn','cancelled':'neutral','preparing':'neutral'} %}
 {% set tone = 'good' if mail.state=='Healthy' or mail.state=='Watching' else ('bad' if mail.state=='Error' else 'warn') %}
-{% macro supply_meters(stats) %}
-{% if stats and stats.supplies %}
-<div class="levels">
-  {% for supply in stats.supplies %}
-  {% set band = 'is-low' if supply.percent <= 15 else ('is-mid' if supply.percent <= 30 else '') %}
-  <div class="level">
-    <div class="level-top"><span>{{ supply.name }}</span><strong>{{ supply.percent }}%</strong></div>
-    <div class="level-track" role="meter" aria-valuenow="{{ supply.percent }}" aria-valuemin="0" aria-valuemax="100" aria-label="{{ supply.name }} level"><span class="level-fill {{ band }}" style="width: {{ supply.percent }}%"></span></div>
-  </div>
-  {% endfor %}
-</div>
+{% macro meter(supply, label) %}
+{% if supply %}
+{% set band = 'is-low' if supply.percent <= 15 else ('is-mid' if supply.percent <= 30 else '') %}
+<div class="level-track" role="meter" aria-valuenow="{{ supply.percent }}" aria-valuemin="0" aria-valuemax="100" aria-label="{{ label }}"><span class="level-fill {{ band }}" style="width: {{ supply.percent }}%"></span></div>
 {% endif %}
+{% endmacro %}
+{% macro printer_station(p) %}
+{% set c = p.condition %}
+{% set toner = c.toner if c else none %}
+{% set drum = c.drum if c else none %}
+{% set paper = c.paper if c else 'unknown' %}
+{% set jam = c.jam if c else 'unknown' %}
+{% set paper_word = {'ready':'In the tray','low':'Paper low','empty':'Out of paper','unknown':'Not reported'} %}
+{% set jam_word = {'clear':'Clear','jam':'Paper jam','unknown':'Not reported'} %}
+<div class="station">
+  <div class="station-visual">
+    <img class="printer-photo" src="/printer-images/{{ p.queue }}" alt="{{ p.label }}" width="260" height="180" {% if p.image.pending %}data-pending="1"{% endif %}>
+    <p class="image-caption">{{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% endif %}</p>
+    {% if p.image.attribution %}
+    <p class="image-caption">{% if p.image.page %}<a href="{{ p.image.page }}" target="_blank" rel="noopener noreferrer">{{ p.image.attribution }}</a>{% else %}{{ p.image.attribution }}{% endif %}{% if p.image.license %} · {{ p.image.license }}{% endif %}</p>
+    {% endif %}
+  </div>
+  <dl class="readout">
+    <div class="read">
+      <dt>{{ toner.name if toner else (c.mark if c else 'Toner') }}</dt>
+      <dd>
+        {% if toner %}
+        <strong>{{ toner.percent }}%</strong>
+        {{ meter(toner, toner.name ~ ' level') }}
+        {% if c.note %}<small>{{ c.note }}</small>{% endif %}
+        {% else %}<strong class="quiet-value">Not reported</strong>{% endif %}
+      </dd>
+    </div>
+    <div class="read">
+      <dt>{{ drum.name if drum else 'Drum' }}</dt>
+      <dd>
+        {% if drum %}
+        <strong>{{ drum.percent }}%</strong>
+        {{ meter(drum, drum.name ~ ' life') }}
+        {% else %}<strong class="quiet-value">Not reported</strong>{% endif %}
+      </dd>
+    </div>
+    <div class="read{% if paper == 'empty' %} is-bad{% elif paper == 'low' %} is-warn{% endif %}">
+      <dt>Paper</dt>
+      <dd><strong>{{ paper_word.get(paper, 'Not reported') }}</strong></dd>
+    </div>
+    <div class="read{% if jam == 'jam' %} is-bad{% endif %}">
+      <dt>Jam</dt>
+      <dd><strong>{{ jam_word.get(jam, 'Not reported') }}</strong></dd>
+    </div>
+  </dl>
+</div>
 {% endmacro %}
 <!doctype html>
 <html lang="en">
@@ -22,7 +62,8 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
-  <link rel="stylesheet" href="/static/style.css?v=9">
+  <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
+  <link rel="stylesheet" href="/static/style.css?v=15">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
@@ -40,7 +81,15 @@
     </ul>
   </nav>
   <div class="sidebar-bottom">
-    <a class="tail-info" href="/?page=tailscale"><span class="green-dot {% if not tail.online %}is-warn{% endif %}"></span><div><strong>Tailscale {{ tail.state }}</strong><small>{{ tail.ip or "No tailnet address" }}</small></div></a>
+    {% if tail.online %}
+    <a class="tail-info" href="/?page=tailscale"><span class="green-dot"></span><div><strong>Tailscale {{ tail.state }}</strong><small>{{ tail.ip or "No tailnet address" }}</small></div></a>
+    {% elif not tail_dismissed %}
+    <div class="tail-info tail-pop" role="status">
+      <span class="green-dot is-warn"></span>
+      <a href="/?page=tailscale"><strong>Tailscale {{ tail.state }}</strong><small>{{ tail.ip or "No tailnet address" }}</small></a>
+      <form method="post" action="/tailscale/dismiss"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="page" value="{{ page }}"><button class="tail-close" type="submit" aria-label="Dismiss Tailscale notice">×</button></form>
+    </div>
+    {% endif %}
     <form method="post" action="/logout"><input type="hidden" name="token" value="{{ token }}"><button class="signout" type="submit">Sign out</button></form>
   </div>
 </aside>
@@ -51,12 +100,24 @@
     {% if error %}<div class="alert bad" role="alert">{{ error }}</div>{% endif %}
     {% if page=='overview' %}
       <div class="headerline"><div><h1>Overview</h1><p class="muted">Printers, jobs, and intake status.</p></div><a class="button subtle" href="/?page=email">Email automation <span aria-hidden="true">→</span></a></div>
-      <div class="metrics">
-        <div class="metric"><span>Registered printers</span><strong>{{ counts.printers }}</strong><small>Ready to print</small></div>
-        <div class="metric"><span>Sent jobs</span><strong>{{ counts.submitted }}</strong><small>{% if counts.pending %}{{ counts.pending }} waiting for a printer{% else %}Finished recently{% endif %}</small></div>
-        <div class="metric"><span>Attention needed</span><strong>{{ counts.errors }}</strong><small>Failed or rejected</small></div>
-        <div class="metric"><span>Email automation</span><strong class="metric-word">{{ mail.state }}</strong><small>{% if mail.detail and mail.state != 'Healthy' %}{{ mail.detail }}{% else %}{{ mail.checked or 'Not checked yet' }}{% endif %}</small></div>
-      </div>
+      {% if printers %}
+      <section class="panel station-panel" aria-labelledby="printer-status-title">
+        <h2 id="printer-status-title" class="visually-hidden">Printer status</h2>
+        {% for p in printers %}
+        {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
+        <article class="station-card">
+          <div class="station-head">
+            <div><h2>{{ p.label }}</h2><p>{{ p.identity or p.host }}{% if p.online and p.stats and p.stats.pages_label %} · {{ p.stats.pages_label }} pages{% endif %}</p></div>
+            <span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Online' if p.online else 'Offline') }}</span>
+          </div>
+          {{ printer_station(p) }}
+          {% if p.supply %}<a class="textlink station-supply" href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer">{{ p.supply.kind }}{% if p.supply.name %} {{ p.supply.name }}{% endif %}</a>{% endif %}
+        </article>
+        {% endfor %}
+      </section>
+      {% else %}
+      <section class="panel"><div class="empty">No printer yet. <a href="/?page=printers">Add one</a> and its readings will show here.</div></section>
+      {% endif %}
       <div class="two-col">
         <section class="panel" aria-labelledby="quick-print-title">
           <div class="panelhead"><div><h2 id="quick-print-title">Quick print</h2><p>Upload a document to a configured queue.</p></div></div>
@@ -64,8 +125,17 @@
           <form action="/jobs/upload" method="post" enctype="multipart/form-data" class="form-stack">
             <input type="hidden" name="token" value="{{ token }}">
             <label class="upload-area"><span class="upload-icon" aria-hidden="true">↑</span><strong>Choose a document</strong><small>PDF, JPG, PNG, TIFF, WEBP, DOCX, XLSX, ODT, ODS, TXT</small><input required type="file" name="file" accept=".pdf,.jpg,.jpeg,.png,.webp,.tif,.tiff,.docx,.xlsx,.odt,.ods,.txt"></label>
+            <fieldset class="dest-grid">
+              <legend>Destination</legend>
+              {% for p in printers %}
+              <label class="dest-choice">
+                <input type="radio" name="printer" value="{{ p.queue }}" {% if loop.first %}checked{% endif %} required>
+                <img src="/printer-images/{{ p.queue }}" alt="" width="40" height="40" {% if p.image.pending %}data-pending="1"{% endif %}>
+                <span>{{ p.label }}</span>
+              </label>
+              {% endfor %}
+            </fieldset>
             <div class="form-row">
-              <label>Destination<select name="printer" required>{% for p in printers %}<option value="{{ p.queue }}">{{ p.label }}</option>{% endfor %}</select></label>
               <label>Layout<select name="sides"><option value="one-sided">Single-sided</option><option value="two-sided-long-edge">Two-sided, long edge</option><option value="two-sided-short-edge">Two-sided, short edge</option></select></label>
               <label>Copies<input name="copies" type="number" min="1" max="10" value="1" inputmode="numeric"></label>
             </div>
@@ -75,40 +145,6 @@
           <div class="empty">No printers configured. <a href="/?page=printers">Add a printer.</a></div>
           {% endif %}
         </section>
-        <section class="panel" aria-labelledby="printer-status-title">
-          <div class="panelhead"><div><h2 id="printer-status-title">Printer status</h2><p>Toner, ink, and page count, read when this page opens.</p></div></div>
-          {% if printers %}
-          <div class="dash-printers">
-            {% for p in printers %}
-            {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
-            <article class="dash-printer">
-              <div class="dash-printer-head">
-                <div><strong>{{ p.label }}</strong><small>{{ p.identity or p.host }}</small></div>
-                <span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Online' if p.online else 'Offline') }}</span>
-              </div>
-              {% if p.stats and p.stats.reasons %}<p class="dash-alert">{{ p.stats.reasons|join(', ') }}</p>{% endif %}
-              {{ supply_meters(p.stats) }}
-              {% if p.online and p.stats and p.stats.pages_label %}<p class="dash-pages"><span>Pages printed</span><strong>{{ p.stats.pages_label }}</strong></p>{% endif %}
-              {% if not p.online %}
-              <p class="form-help">Levels show when the printer is online.</p>
-              {% elif not p.stats or not p.stats.supplies %}
-              <p class="form-help">This printer did not report a toner or ink level.</p>
-              {% endif %}
-              {% if p.supply %}
-              <div class="supply-link">
-                <span>{{ p.supply.kind }}{% if p.supply.name %} {{ p.supply.name }}{% endif %}</span>
-                <a href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer">Lowest price on Amazon</a>
-              </div>
-              {% endif %}
-            </article>
-            {% endfor %}
-          </div>
-          {% else %}
-          <div class="empty">Printers appear here after a queue is added.</div>
-          {% endif %}
-          <a class="footlink" href="/?page=printers">Printer setup</a>
-        </section>
-      </div>
       <section class="panel" aria-labelledby="recent-jobs-title">
         <div class="panelhead"><div><h2 id="recent-jobs-title">Recent jobs</h2><p>Pending waits for the printer. Sent is already at the printer and cannot be cancelled.</p></div><a class="textlink" href="/?page=jobs">All jobs</a></div>
         {% if jobs %}
@@ -121,36 +157,93 @@
         <div class="empty">No print jobs yet.</div>
         {% endif %}
       </section>
+      </div>
     {% elif page=='printers' %}
       <div class="headerline"><div><h1>Printers</h1><p class="muted">Add a printer by its address. PrintHarbor reads it and selects a driver.</p></div></div>
       <div class="two-col">
         <section class="panel" aria-labelledby="destinations-title">
-          <div class="panelhead"><div><h2 id="destinations-title">Connected destinations</h2><p>Status, toner, and page count are read when this page opens.</p></div></div>
+          <div class="panelhead"><div><h2 id="destinations-title">Connected destinations</h2><p>Drum, toner, paper, and jams, read when this page opens.</p></div></div>
           {% if printers %}
           <div class="printer-list">
             {% for p in printers %}
             {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
             <div class="printer-block">
-              <div class="printer-line expand"><div class="printer-glyph" aria-hidden="true"><svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V3h12v6"/><path d="M6 18H4a2 2 0 0 1-2-2v-5a2 2 0 0 1 2-2h16a2 2 0 0 1 2 2v5a2 2 0 0 1-2 2h-2"/><path d="M6 14h12v7H6z"/></svg></div><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
+              <div class="printer-line expand"><img class="printer-thumb" src="/printer-images/{{ p.queue }}" alt="" width="44" height="44" {% if p.image.pending %}data-pending="1"{% endif %}><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}</small><small>{{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% endif %}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
+              {{ printer_station(p) }}
+              {% if p.online and p.stats and (p.stats.pages_label or p.stats.serial or p.stats.firmware) %}
+              <p class="station-facts">{% if p.stats.pages_label %}<span>Pages <strong>{{ p.stats.pages_label }}</strong></span>{% endif %}{% if p.stats.serial %}<span>Serial <strong>{{ p.stats.serial }}</strong></span>{% endif %}{% if p.stats.firmware %}<span>Firmware <strong>{{ p.stats.firmware }}</strong></span>{% endif %}</p>
+              {% endif %}
+              {% if p.options %}
+              <form class="form-stack driver-settings" method="post" action="/printers/options">
+                <input type="hidden" name="token" value="{{ token }}">
+                <input type="hidden" name="queue" value="{{ p.queue }}">
+                <fieldset>
+                  <legend>Driver settings</legend>
+                  <div class="form-row">
+                    {% for opt in p.options %}
+                    <label>{{ opt.label }}
+                      <select name="opt_{{ opt.key }}">
+                        {% for value in opt['values'] %}
+                        <option value="{{ value }}" {% if value == opt.current %}selected{% endif %}>{{ 'On' if value == 'True' else ('Off' if value == 'False' else value) }}</option>
+                        {% endfor %}
+                      </select>
+                    </label>
+                    {% endfor %}
+                  </div>
+                </fieldset>
+                <button class="button subtle" type="submit">Save settings</button>
+              </form>
+              {% endif %}
+              <details class="image-change" {% if image_preview == p.queue %}open{% endif %}>
+                <summary>Change printer image</summary>
+                <form class="form-stack" method="post" action="/printers/image" enctype="multipart/form-data">
+                  <input type="hidden" name="token" value="{{ token }}">
+                  <input type="hidden" name="queue" value="{{ p.queue }}">
+                  {% if p.image.candidates %}
+                  <fieldset class="candidate-list">
+                    <legend>Matching images</legend>
+                    {% for cand in p.image.candidates %}
+                    <label>
+                      <input type="radio" name="choice" value="{{ cand.kind }}:{{ cand.id }}">
+                      <img src="/printer-images/candidate/{{ cand.kind }}/{{ cand.id }}" alt="">
+                      <span>{{ cand.title }}{% if cand.license %} · {{ cand.license }}{% endif %}</span>
+                    </label>
+                    {% endfor %}
+                  </fieldset>
+                  {% endif %}
+                  <label>Upload a PNG, JPEG, WebP, or SVG<input type="file" name="upload" accept=".png,.jpg,.jpeg,.webp,.svg,image/png,image/jpeg,image/webp,image/svg+xml"></label>
+                  {% if image_preview == p.queue %}
+                  <img class="printer-photo preview-photo" src="/printer-images/preview/{{ p.queue }}" alt="Preview of the uploaded image" width="260" height="180">
+                  <button class="button" type="submit" name="action" value="apply-preview">Use this image</button>
+                  {% else %}
+                  <button class="button subtle" type="submit" name="action" value="preview">Preview upload</button>
+                  {% endif %}
+                  <label>Illustration
+                    <select name="illustration">
+                      <option value="">Keep the current picture</option>
+                      <option value="mono">Mono laser</option>
+                      <option value="color">Color laser</option>
+                      <option value="mfp">Multifunction</option>
+                      <option value="inkjet">Inkjet</option>
+                      <option value="label">Label</option>
+                      <option value="receipt">Receipt</option>
+                      <option value="large">Large format</option>
+                      <option value="generic">Generic</option>
+                    </select>
+                  </label>
+                  <div class="actions">
+                    <button class="button" type="submit" name="action" value="apply">Save image choice</button>
+                    <button class="button subtle" type="submit" name="action" value="search">Search again</button>
+                    <button class="button subtle" type="submit" name="action" value="auto">Restore automatic</button>
+                  </div>
+                </form>
+              </details>
               {% if p.supply %}
               <div class="supply-link">
                 <span>{{ p.supply.kind }}{% if p.supply.name %} {{ p.supply.name }}{% endif %}</span>
                 <a href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer">Lowest price on Amazon</a>
                 {% if p.supply.note %}<small>{{ p.supply.note }}</small>{% endif %}
               </div>
-              {% endif %}
-              {% if p.online and p.stats and (p.stats.reasons or p.stats.pages_label or p.stats.supplies or p.stats.serial or p.stats.firmware) %}
-              {{ supply_meters(p.stats) }}
-              {% if p.stats.reasons or p.stats.pages_label or p.stats.serial or p.stats.firmware %}
-              <div class="printer-stats" aria-label="Readings for {{ p.label }}">
-                {% if p.stats.reasons %}<div><span>Needs attention</span><strong>{{ p.stats.reasons|join(', ') }}</strong></div>{% endif %}
-                {% if p.stats.pages_label %}<div><span>Pages printed</span><strong>{{ p.stats.pages_label }}</strong></div>{% endif %}
-                {% if p.stats.serial %}<div><span>Serial</span><strong>{{ p.stats.serial }}</strong></div>{% endif %}
-                {% if p.stats.firmware %}<div><span>Firmware</span><strong>{{ p.stats.firmware }}</strong></div>{% endif %}
-              </div>
-              {% endif %}
-              {% elif p.online %}
-              <p class="form-help printer-quiet">This printer did not report supplies or a page count.</p>
               {% endif %}
             </div>
             {% endfor %}
@@ -182,12 +275,36 @@
             <label>Display name<input name="label" placeholder="Brother HL-L2380DW" required maxlength="100"></label>
             <label>Queue name<input name="queue" placeholder="Office" required pattern="[A-Za-z][A-Za-z0-9_-]{0,40}" maxlength="41" autocapitalize="off" spellcheck="false"></label>
             <label>Printer IPv4<input name="host" required placeholder="192.168.50.40" inputmode="decimal" autocomplete="off" spellcheck="false" aria-describedby="printer-help"></label>
-            <p id="printer-help" class="form-help">PrintHarbor reads the make and model, then picks a matching driver. A Brother laser uses the Brother driver so the page stays dark. Other printers use the description they provide.</p>
+            <p id="printer-help" class="form-help">PrintHarbor reads the make and model, then picks a matching driver. Driver settings can be changed on the printer after it is added.</p>
             <button class="button" type="submit">Create printer queue <span aria-hidden="true">→</span></button>
           </form>
           {% endif %}
         </section>
       </div>
+      <section class="panel" aria-labelledby="printer-images-title">
+        <div class="panelhead"><div><h2 id="printer-images-title">Printer images</h2><p>Each model is identified once and saved on this host. A second printer of the same model reuses that file.</p></div></div>
+        <form method="post" action="/settings/images" class="form-stack">
+          <input type="hidden" name="token" value="{{ token }}">
+          <label class="toggle"><input type="checkbox" name="images_auto" value="1" {% if config.images_auto=='1' %}checked{% endif %}><span><strong>Identify printer images automatically</strong><small>Look up a product image after a printer is added. Printing is not delayed.</small></span></label>
+          <label class="toggle"><input type="checkbox" name="images_unifi" value="1" {% if config.images_unifi=='1' %}checked{% endif %}><span><strong>Use the UniFi device catalog</strong><small>Match the model against the public fingerprint list, then download one image from Ubiquiti. Turn this off to skip that catalog.</small></span></label>
+          <label class="toggle"><input type="checkbox" name="images_wikimedia" value="1" {% if config.images_wikimedia=='1' %}checked{% endif %}><span><strong>Use Wikimedia Commons</strong><small>Only when the file title contains the model and the license is free to reuse.</small></span></label>
+          <label class="toggle"><input type="checkbox" name="images_cache" value="1" {% if config.images_cache=='1' %}checked{% endif %}><span><strong>Keep a local copy</strong><small>Download each model once. Later printers of that model do not contact the catalog again.</small></span></label>
+          <label>Refresh the device catalog after<input type="number" name="images_catalog_days" min="1" max="90" value="{{ config.images_catalog_days or 14 }}" inputmode="numeric"><small>Days before the fingerprint list is downloaded again. A failed refresh keeps the previous list.</small></label>
+          <div class="actions">
+            <button class="button" type="submit" name="action" value="save">Save image settings</button>
+            <button class="button subtle" type="submit" name="action" value="refresh">Refresh catalog</button>
+            <button class="button subtle" type="submit" name="action" value="rescan">Rescan printers</button>
+            <button class="button subtle" type="submit" name="action" value="clear">Clear cache</button>
+          </div>
+        </form>
+        {% if printers %}
+        <ul class="plainlist image-source-list">
+          {% for p in printers %}
+          <li>{{ p.label }}: {{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% else %} · Illustration{% endif %}</li>
+          {% endfor %}
+        </ul>
+        {% endif %}
+      </section>
       <section class="panel" aria-labelledby="cups-status-title">
         <div class="panelhead"><div><h2 id="cups-status-title">CUPS queues</h2><p>Live listing from the local CUPS service.</p></div></div>
         {% if not cups_report.ok %}
@@ -282,88 +399,104 @@
       </section>
     {% elif page=='email' %}
       <div class="headerline">
-        <div><h1>Email automation</h1><p class="muted">New mail in the selected folder prints to the default queue.</p></div>
+        <div><h1>Email automation</h1><p class="muted">New mail in one folder prints to one printer.</p></div>
         <div class="mail-health is-{{ tone }}"><span class="green-dot {% if tone=='bad' %}is-bad{% elif tone!='good' %}is-warn{% endif %}"></span><div><strong>{{ mail.state }}</strong><small>{{ mail.detail or mail.checked or 'Not checked yet' }}</small></div></div>
       </div>
-      <form method="post" action="/settings/save" class="stack">
+      <form method="post" action="/settings/save" class="setup-form">
         <input type="hidden" name="token" value="{{ token }}">
-        <section class="panel" aria-labelledby="mailbox-title">
-          <div class="panelhead"><div><h2 id="mailbox-title">Mail connection</h2><p>Saved settings apply on the next check. Only new mail in the selected folder is read.</p></div><span class="chip">IMAP over TLS</span></div>
-          <div class="form-stack">
-            <label class="toggle"><input type="checkbox" name="mail_enabled" value="1" {% if config.mail_enabled=='1' %}checked{% endif %}><span><strong>Enable automatic email printing</strong><small>Watch the selected folder and print new mail as it arrives. Mail already in the folder is left alone. Save after turning this on.</small></span></label>
-            <div class="form-row">
-              <label>IMAP server<input name="imap_host" required value="{{ config.imap_host }}" placeholder="imap.gmail.com" autocapitalize="off" spellcheck="false"></label>
-              <label>Port<input type="number" name="imap_port" min="1" max="65535" value="{{ config.imap_port }}" inputmode="numeric"></label>
-            </div>
-            <div class="form-row">
-              <label>Mailbox email<input type="email" name="imap_user" value="{{ config.imap_user }}" placeholder="printer@gmail.com" autocomplete="off"></label>
-              <label>App password<input type="password" name="imap_password" autocomplete="new-password" placeholder="{% if config.imap_password %}Saved. Leave blank to keep{% else %}Enter app password{% endif %}"><small>Spaces are removed so a Gmail app password can be pasted as shown. Leave blank to keep the saved password.</small></label>
-            </div>
-            <label>Mailbox folder<select name="imap_folder" required>{% for folder in folders %}<option value="{{ folder }}" {% if config.imap_folder==folder %}selected{% endif %}>{{ folder }}</option>{% endfor %}</select><small>Load the mailbox folders, then choose one. The saved folder stays listed before you load.</small></label>
-            <div><button class="button subtle" type="submit" formaction="/mail/folders">Load folders</button></div>
+        <ol class="setup-steps">
+          <li>
+            <span class="step-index" aria-hidden="true">1</span>
+            <section aria-labelledby="mail-on-title">
+              <h2 id="mail-on-title">Turn it on</h2>
+              <p class="step-lead">Only new mail is printed. Mail already in the folder is left alone.</p>
+              <label class="toggle"><input type="checkbox" name="mail_enabled" value="1" {% if config.mail_enabled=='1' %}checked{% endif %}><span><strong>Enable email printing</strong><small>Save after turning this on.</small></span></label>
+            </section>
+          </li>
+          <li>
+            <span class="step-index" aria-hidden="true">2</span>
+            <section aria-labelledby="mailbox-title">
+              <h2 id="mailbox-title">Connect the mailbox</h2>
+              <p class="step-lead">Use an app password. Spaces in a Gmail password are removed.</p>
+              <div class="form-stack">
+                <div class="form-row">
+                  <label>Mailbox email<input type="email" name="imap_user" value="{{ config.imap_user }}" placeholder="printer@gmail.com" autocomplete="off"></label>
+                  <label>App password<input type="password" name="imap_password" autocomplete="new-password" placeholder="{% if config.imap_password %}Saved. Leave blank to keep{% else %}App password{% endif %}"></label>
+                </div>
+                <div class="form-row">
+                  <label>IMAP server<input name="imap_host" required value="{{ config.imap_host }}" placeholder="imap.gmail.com" autocapitalize="off" spellcheck="false"></label>
+                  <label>Port<input type="number" name="imap_port" min="1" max="65535" value="{{ config.imap_port }}" inputmode="numeric"></label>
+                </div>
+                <div class="folder-row">
+                  <label>Folder<select name="imap_folder" required>{% for folder in folders %}<option value="{{ folder }}" {% if config.imap_folder==folder %}selected{% endif %}>{{ folder }}</option>{% endfor %}</select></label>
+                  <button class="button subtle" type="submit" formaction="/mail/folders">Load folders</button>
+                </div>
+              </div>
+            </section>
+          </li>
+          <li>
+            <span class="step-index" aria-hidden="true">3</span>
+            <section aria-labelledby="print-title">
+              <h2 id="print-title">Choose the printer</h2>
+              <p class="step-lead">DUPLEX, SHORT EDGE, and COPIES=3 in the subject override this.</p>
+              <div class="form-stack">
+                {% if not printers %}<p class="form-help">Add a printer before email can print.</p>{% endif %}
+                <div class="form-row">
+                  <label>Printer<select name="default_queue"><option value="">Select printer</option>{% for p in printers %}<option value="{{ p.queue }}" {% if config.default_queue==p.queue %}selected{% endif %}>{{ p.label }}</option>{% endfor %}</select></label>
+                  <label>Sides<select name="default_sides"><option value="one-sided" {% if config.default_sides=='one-sided' %}selected{% endif %}>Single-sided</option><option value="two-sided-long-edge" {% if config.default_sides=='two-sided-long-edge' %}selected{% endif %}>Long-edge duplex</option><option value="two-sided-short-edge" {% if config.default_sides=='two-sided-short-edge' %}selected{% endif %}>Short-edge duplex</option></select></label>
+                </div>
+                <div class="form-row">
+                  <label>Max pages<input type="number" name="max_pages" min="1" max="200" value="{{ config.max_pages }}" inputmode="numeric"></label>
+                  <label>Max file size (MB)<input type="number" name="max_mb" min="1" max="30" value="{{ config.max_mb }}" inputmode="numeric"></label>
+                  <label>Attachments<input type="number" name="max_files" min="1" max="10" value="{{ config.max_files }}" inputmode="numeric"></label>
+                  <label>Check every (seconds)<input type="number" name="poll_seconds" min="2" max="3600" value="{{ config.poll_seconds }}" inputmode="numeric"></label>
+                </div>
+                <label class="toggle"><input type="checkbox" name="print_email_body" value="1" {% if config.print_email_body=='1' %}checked{% endif %}><span><strong>Print the message text</strong><small>Only when there is no attachment.</small></span></label>
+              </div>
+            </section>
+          </li>
+          <li>
+            <span class="step-index" aria-hidden="true">4</span>
+            <section aria-labelledby="who-title">
+              <h2 id="who-title">Limit who can print <span class="chip">Optional</span></h2>
+              <p class="step-lead">Leave a field blank to skip that rule.</p>
+              <div class="form-stack">
+                <label>Allowed senders<input name="allowed_senders" value="{{ config.allowed_senders }}" placeholder="name@example.com" autocapitalize="off" spellcheck="false"><small>Blank accepts any sender. Separate addresses with commas.</small></label>
+                <label>Must be sent to<input name="mail_recipient" type="email" value="{{ config.mail_recipient }}" placeholder="printer@example.com"><small>Blank accepts any To or Cc.</small></label>
+                <label>Subject PIN<input name="new_pin" maxlength="32" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" placeholder="6 to 32 letters or digits"><small>{% if config.email_pin %}A PIN is on. Leave this blank and save to remove it.{% else %}Blank means no PIN.{% endif %}</small></label>
+              </div>
+            </section>
+          </li>
+          <li>
+            <span class="step-index" aria-hidden="true">5</span>
+            <section aria-labelledby="reply-title">
+              <h2 id="reply-title">Reply to the sender</h2>
+              <p class="step-lead">One email when a message is printed or refused. Leave the From address blank to use the mailbox.</p>
+              <div class="form-stack">
+                <label class="toggle"><input type="checkbox" name="reply_enabled" value="1" {% if config.reply_enabled=='1' %}checked{% endif %}><span><strong>Send a result email</strong></span></label>
+                <label>From address<input type="email" name="smtp_from" value="{{ config.smtp_from }}" placeholder="Same as the mailbox" autocomplete="off"></label>
+                <div class="form-row">
+                  <label>SMTP server<input name="smtp_host" value="{{ config.smtp_host or 'smtp.gmail.com' }}" placeholder="smtp.gmail.com" autocapitalize="off" spellcheck="false"></label>
+                  <label>SMTP port<input type="number" name="smtp_port" min="1" max="65535" value="{{ config.smtp_port or '587' }}" inputmode="numeric"></label>
+                </div>
+              </div>
+            </section>
+          </li>
+        </ol>
+        <section class="panel subject-panel" aria-labelledby="subject-title">
+          <h2 id="subject-title">Subject</h2>
+          <p class="step-lead">Use one of these. Extra words such as DUPLEX override the sides above.</p>
+          <div class="subject-pills">
+            <code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %}</code>
+            <code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} DUPLEX</code>
+            <code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} SHORT EDGE</code>
+            <code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} DUPLEX COPIES=3</code>
           </div>
         </section>
-        <section class="panel" aria-labelledby="security-controls-title">
-          <div class="panelhead"><div><h2 id="security-controls-title">Security controls</h2><p>Leave a field blank to turn that check off.</p></div></div>
-          <div class="form-stack">
-            <label>Approved sender emails<input name="allowed_senders" value="{{ config.allowed_senders }}" placeholder="Leave blank to accept any sender" autocapitalize="off" spellcheck="false"><small>Leave blank to accept mail from any sender. When filled, only these exact addresses can submit jobs. Separate them with commas.</small></label>
-            <label>Required destination email<input name="mail_recipient" type="email" value="{{ config.mail_recipient }}" placeholder="Leave blank to ignore destination"><small>Leave blank to accept any To or Cc. When filled, To or Cc must include this address.</small></label>
-            <label>Email subject PIN<input name="new_pin" maxlength="32" autocapitalize="off" autocorrect="off" spellcheck="false" autocomplete="off" placeholder="Leave blank to require no PIN"><small>{% if config.email_pin %}A PIN is on. Leave this box blank and save to turn it off. Type the PIN shown in the examples to keep it, or type a new one to replace it.{% else %}No PIN is required. Enter 6 to 32 letters or digits to require one, or leave blank.{% endif %}</small></label>
-          </div>
-        </section>
-        <section class="panel" aria-labelledby="print-behavior-title">
-          <div class="panelhead"><div><h2 id="print-behavior-title">Print behavior</h2><p>Used when a message does not name its own layout.</p></div></div>
-          <div class="form-stack">
-            {% if not printers %}<p class="form-help">Add a printer before email intake can submit jobs.</p>{% endif %}
-            <div class="form-row">
-              <label>Default printer<select name="default_queue"><option value="">Select printer</option>{% for p in printers %}<option value="{{ p.queue }}" {% if config.default_queue==p.queue %}selected{% endif %}>{{ p.label }}</option>{% endfor %}</select></label>
-              <label>Default sides<select name="default_sides"><option value="one-sided" {% if config.default_sides=='one-sided' %}selected{% endif %}>Single-sided</option><option value="two-sided-long-edge" {% if config.default_sides=='two-sided-long-edge' %}selected{% endif %}>Long-edge duplex</option><option value="two-sided-short-edge" {% if config.default_sides=='two-sided-short-edge' %}selected{% endif %}>Short-edge duplex</option></select><small>Used when the subject does not say DUPLEX, 2-SIDED, or SHORT EDGE.</small></label>
-            </div>
-            <div class="form-row">
-              <label>Maximum pages per file<input type="number" name="max_pages" min="1" max="200" value="{{ config.max_pages }}" inputmode="numeric"></label>
-              <label>Maximum file size (MB)<input type="number" name="max_mb" min="1" max="30" value="{{ config.max_mb }}" inputmode="numeric"></label>
-              <label>Attachments per message<input type="number" name="max_files" min="1" max="10" value="{{ config.max_files }}" inputmode="numeric"></label>
-              <label>Backup check (seconds)<input type="number" name="poll_seconds" min="2" max="3600" value="{{ config.poll_seconds }}" inputmode="numeric"><small>New mail is picked up as it arrives. This backup check is used only when the mailbox cannot push, and it never waits more than 5 seconds.</small></label>
-            </div>
-            <label class="toggle"><input type="checkbox" name="print_email_body" value="1" {% if config.print_email_body=='1' %}checked{% endif %}><span><strong>Print plain-text body as fallback</strong><small>Only when the message has no supported attachment.</small></span></label>
-          </div>
-        </section>
-        <section class="panel" aria-labelledby="result-mail-title">
-          <div class="panelhead"><div><h2 id="result-mail-title">Result email</h2><p>One reply when a message is accepted or rejected.</p></div></div>
-          <div class="form-stack">
-            <label class="toggle"><input type="checkbox" name="reply_enabled" value="1" {% if config.reply_enabled=='1' %}checked{% endif %}><span><strong>Email the sender the result</strong><small>One reply when the message is accepted or rejected, including the reason.</small></span></label>
-            <label>From address<input type="email" name="smtp_from" value="{{ config.smtp_from }}" placeholder="printme@example.com" autocomplete="off"><small>Gmail logs in with the mailbox address above. This From address can be a Send mail as alias. Leave blank to send from the mailbox address.</small></label>
-            <div class="form-row">
-              <label>SMTP server<input name="smtp_host" value="{{ config.smtp_host or 'smtp.gmail.com' }}" placeholder="smtp.gmail.com" autocapitalize="off" spellcheck="false"></label>
-              <label>SMTP port<input type="number" name="smtp_port" min="1" max="65535" value="{{ config.smtp_port or '587' }}" inputmode="numeric"><small>Port 465 uses implicit TLS. Other ports use STARTTLS.</small></label>
-            </div>
-            <div><button class="button" type="submit">Save automation settings <span aria-hidden="true">→</span></button></div>
-          </div>
-        </section>
+        <div class="save-row"><button class="button" type="submit">Save <span aria-hidden="true">→</span></button></div>
       </form>
-      <div class="two-col">
-        <section class="panel" aria-labelledby="examples-title">
-          <h2 id="examples-title">Subject examples</h2>
-          <p class="muted">{% if config.email_pin %}Put the current PIN in the subject. Clear the PIN field above and save to stop requiring one.{% else %}No PIN is set. DUPLEX, 2-SIDED, SHORT EDGE, and COPIES= still work.{% endif %}</p>
-          <div class="command-example"><span>Single-sided</span><code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %}</code></div>
-          <div class="command-example"><span>Long-edge duplex</span><code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} DUPLEX</code></div>
-          <div class="command-example"><span>3 copies, duplex</span><code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} DUPLEX COPIES=3</code></div>
-          <div class="command-example"><span>Short-edge duplex</span><code>PRINT{% if config.email_pin %} PIN:{{ config.email_pin }}{% endif %} SHORT EDGE</code></div>
-        </section>
-        <section class="panel" aria-labelledby="security-title">
-          <h2 id="security-title">What is enforced</h2>
-          <ul class="plainlist">
-            <li>Leave the sender list, destination, or PIN blank to turn that check off. Filled fields are still enforced</li>
-            <li>IMAP over TLS, with the mailbox password encrypted at rest</li>
-            <li>Attachment size, count, and PDF page limits</li>
-            <li>UID deduplication so a seen message is not printed twice</li>
-            <li>Rejected mail is kept in the event log, not described as healthy</li>
-            <li>Dashboard actions require the signed-in session and a request token</li>
-          </ul>
-        </section>
-      </div>
     {% endif %}
-    {% if page=='overview' or page=='email' %}
+    {% if page=='overview' %}
     <section class="panel" aria-labelledby="event-log-title">
       <div class="panelhead"><div><h2 id="event-log-title">Event log</h2><p>Mail rejections, CUPS results, and configuration changes.</p></div></div>
       {% if events %}
@@ -385,5 +518,14 @@
   <footer>PrintHarbor <span>Jobs stay on this host. CUPS acceptance is not a printed page.</span></footer>
 </main>
 </div>
+<script>
+document.querySelectorAll('img[data-pending]').forEach(function (img) {
+  window.setTimeout(function () {
+    img.removeAttribute('data-pending');
+    var base = img.getAttribute('src').split('?')[0];
+    img.src = base + '?ready=1';
+  }, 3000);
+});
+</script>
 </body>
 </html>

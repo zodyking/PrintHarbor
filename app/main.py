@@ -6,11 +6,11 @@ from contextlib import asynccontextmanager
 from pathlib import Path
 from urllib.parse import urlencode
 from fastapi import FastAPI, Request, Form, UploadFile, File, HTTPException
-from fastapi.responses import HTMLResponse, RedirectResponse
+from fastapi.responses import FileResponse, HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
-from . import mailer, printing, store, supplies, tailnet
+from . import images, mailer, printing, store, supplies, tailnet
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -21,15 +21,22 @@ async def lifespan(app: FastAPI):
         store.event('warning', 'Saved printers could not be checked')
     mailer.STOP.clear()
     printing.STOP.clear()
+    images.STOP.clear()
+    images.KICK.clear()
     thread = threading.Thread(target=mailer.run_loop, daemon=True, name='imap-poller')
     queue_thread = threading.Thread(target=printing.run_queue, daemon=True, name='print-queue')
+    image_thread = threading.Thread(target=images.run_loop, daemon=True, name='printer-images')
     thread.start()
     queue_thread.start()
+    image_thread.start()
     yield
     mailer.STOP.set()
     printing.STOP.set()
+    images.STOP.set()
+    images.KICK.set()
     thread.join(timeout=4)
     queue_thread.join(timeout=2)
+    image_thread.join(timeout=2)
 
 secret = os.getenv('SESSION_SECRET', '')
 if len(secret) < 32 or secret.startswith('REPLACE_'):
@@ -101,7 +108,11 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
         for printer in printers:
             printer['online'] = printing.printer_reachable(printer['host'], printer['protocol'])
             printer['stats'] = printing.printer_stats(printer['host']) if printer['online'] else None
+            printer['condition'] = printing.condition(printer['stats'], printer['online'])
             printer['supply'] = supplies.replacement_for(printer.get('identity') or printer.get('label') or '')
+            printer['image'] = images.describe(printer)
+            if page == 'printers':
+                printer['options'] = printing.queue_options(printer['queue'])
     jobs = store.records('jobs', 100) if page in ('overview', 'jobs') else []
     counts = {
         'total': len(jobs),
@@ -121,12 +132,14 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
         'jobs': jobs,
         'counts': counts,
         'mail': mailer.snapshot(),
-        'events': store.records('events', 12) if page in ('overview', 'email') else [],
+        'events': store.records('events', 12) if page == 'overview' else [],
         'tail': tailnet.status(),
+        'tail_dismissed': bool(request.session.get('tail_dismissed')),
         'active_jobs': printing.active_jobs() if page == 'jobs' else EMPTY_CUPS,
         'cups_report': printing.cups_printers() if page == 'printers' else EMPTY_CUPS,
         'notice': notice,
         'error': error,
+        'image_preview': (request.query_params.get('preview') or '').strip(),
     })
 
 @app.get('/', response_class=HTMLResponse)
@@ -166,6 +179,20 @@ def remove_printer(request: Request, token: str = Form(...), queue: str = Form(.
         if store.settings().get('default_queue') == queue:
             store.set_setting('default_queue', '')
         return nextpage('printers', 'Printer removed')
+    except Exception as exc:
+        return nextpage('printers', error=str(exc))
+
+@app.post('/printers/options')
+async def printer_options(request: Request, token: str = Form(...), queue: str = Form(...)):
+    csrf(request, token)
+    form = await request.form()
+    choices = {}
+    for key, value in form.multi_items():
+        if key.startswith('opt_') and isinstance(value, str):
+            choices[key[4:]] = value
+    try:
+        printing.apply_queue_options(queue, choices)
+        return nextpage('printers', 'Driver settings saved')
     except Exception as exc:
         return nextpage('printers', error=str(exc))
 
@@ -323,6 +350,108 @@ def mail_folders(
         text = str(exc).replace(secret, '')[:180]
         return render_page(request, 'email', error=text or 'Could not list mailbox folders', config=shown)
     return render_page(request, 'email', notice='Folders loaded', config=shown, folders=names)
+
+def _image_response(path, media, cache):
+    return FileResponse(path, media_type=media, headers={'Cache-Control': cache, 'X-Content-Type-Options': 'nosniff'})
+
+@app.get('/printer-images/candidate/{kind}/{item}')
+def printer_candidate(request: Request, kind: str, item: str):
+    require_auth(request)
+    path = images.ensure_candidate(kind, item)
+    if not path:
+        svg, media = images.static_svg('generic')
+        return _image_response(svg, media, 'private, max-age=60')
+    return _image_response(path, images.media_type(path), 'private, max-age=86400')
+
+@app.get('/printer-images/preview/{queue}')
+def printer_preview(request: Request, queue: str):
+    require_auth(request)
+    path = images.preview_file(queue)
+    if not path:
+        raise HTTPException(status_code=404, detail='No preview')
+    return _image_response(path, images.media_type(path), 'private, no-cache')
+
+@app.get('/printer-images/{queue}')
+def printer_image(request: Request, queue: str):
+    require_auth(request)
+    if not images.QUEUE_RE.fullmatch(queue or ''):
+        raise HTTPException(status_code=404, detail='Unknown printer')
+    path, media = images.file_for(queue)
+    printer = images._printer(queue)
+    pending = bool(printer and images.describe(printer).get('pending'))
+    return _image_response(path, media, 'private, no-cache' if pending else 'private, max-age=3600')
+
+@app.post('/printers/image')
+def printer_image_choice(
+    request: Request, token: str = Form(...), queue: str = Form(...), action: str = Form(...),
+    choice: str = Form(''), illustration: str = Form(''), upload: UploadFile | None = File(None),
+):
+    csrf(request, token)
+    if not images.QUEUE_RE.fullmatch(queue or ''):
+        return nextpage('printers', error='Invalid queue')
+    try:
+        if action == 'search':
+            images.search_again(queue)
+            return nextpage('printers', 'Printer image searched again')
+        if action == 'auto':
+            images.restore_auto(queue)
+            return nextpage('printers', 'Automatic printer image restored')
+        if action == 'preview':
+            if upload is None or not upload.filename:
+                return nextpage('printers', error='Choose an image to preview')
+            images.save_upload(queue, upload.filename, upload.file.read(2_100_000))
+            return RedirectResponse(f'/?page=printers&preview={queue}', status_code=303)
+        if action == 'apply-preview':
+            images.apply_preview(queue)
+            return nextpage('printers', 'Printer image saved')
+        if action == 'apply':
+            if choice:
+                images.apply_choice(queue, choice)
+            elif illustration:
+                images.apply_illustration(queue, illustration)
+            elif upload is not None and upload.filename:
+                images.save_upload(queue, upload.filename, upload.file.read(2_100_000))
+                return RedirectResponse(f'/?page=printers&preview={queue}', status_code=303)
+            else:
+                return nextpage('printers', error='Choose an image first')
+            return nextpage('printers', 'Printer image saved')
+    except images.ImageError as exc:
+        return nextpage('printers', error=str(exc))
+    return nextpage('printers', error='That image action is not available')
+
+@app.post('/settings/images')
+def save_image_settings(
+    request: Request, token: str = Form(...), action: str = Form('save'),
+    images_auto: str = Form('0'), images_unifi: str = Form('0'), images_wikimedia: str = Form('0'),
+    images_cache: str = Form('0'), images_catalog_days: str = Form('14'),
+):
+    csrf(request, token)
+    try:
+        if action == 'refresh':
+            if not images.refresh_fingerprint(force=True):
+                return nextpage('printers', error='The printer catalog could not be refreshed. The previous copy was kept.')
+            return nextpage('printers', 'Printer catalog refreshed')
+        if action == 'clear':
+            images.clear_cache()
+            return nextpage('printers', 'Printer image cache cleared')
+        if action == 'rescan':
+            images.rescan_all()
+            return nextpage('printers', 'Printer images will be looked up again')
+        images.update_settings(
+            images_auto == '1', images_unifi == '1', images_wikimedia == '1',
+            images_cache == '1', images_catalog_days,
+        )
+    except images.ImageError as exc:
+        return nextpage('printers', error=str(exc))
+    return nextpage('printers', 'Printer image settings saved')
+
+@app.post('/tailscale/dismiss')
+def tailscale_dismiss(request: Request, token: str = Form(...), page: str = Form('overview')):
+    csrf(request, token)
+    request.session['tail_dismissed'] = '1'
+    if page not in ('overview', 'printers', 'jobs', 'email', 'tailscale'):
+        page = 'overview'
+    return RedirectResponse('/' if page == 'overview' else f'/?page={page}', status_code=303)
 
 @app.post('/tailscale/up')
 def tailscale_up(request: Request, token: str = Form(...), auth_key: str = Form(...), hostname: str = Form('printharbor')):
