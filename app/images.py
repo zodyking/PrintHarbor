@@ -4,11 +4,13 @@ A make and model is downloaded once into DATA_DIR and reused. Lookup runs on a
 background thread. Pages only read the local catalog.
 """
 import hashlib
+import ipaddress
 import json
 import os
 import re
 import shutil
 import threading
+import urllib.request
 from datetime import datetime, timedelta, timezone
 from io import BytesIO
 from pathlib import Path
@@ -41,6 +43,7 @@ ITEM_RE = re.compile(r'^[A-Za-z0-9_-]{1,40}$')
 LABELS = {
     'unifi': 'UniFi',
     'wikimedia': 'Wikimedia Commons',
+    'printer': 'This printer',
     'upload': 'Your image',
     'svg': 'Illustration',
     'miss': 'Illustration',
@@ -485,7 +488,7 @@ def _fresh(row):
     if not row:
         return False
     source = row.get('source') or ''
-    if source in ('unifi', 'wikimedia', 'upload'):
+    if source in ('unifi', 'wikimedia', 'printer', 'upload'):
         return bool(row.get('local_path')) and _inside(row['local_path'])
     if source == 'svg':
         return True
@@ -581,7 +584,8 @@ def _download_unifi(ident, match, candidates, confidence):
 
 
 def _wiki_search(ident):
-    query = ' '.join(part for part in (ident.get('manufacturer') or '', ident.get('display') or ident.get('code') or '', 'printer') if part)
+    shown = ident.get('display') or ident.get('code') or ''
+    query = ' '.join(part for part in (f'intitle:{shown}' if shown else '', ident.get('manufacturer') or '', 'printer') if part)
     url = 'https://commons.wikimedia.org/w/api.php?' + urlencode({
         'action': 'query',
         'format': 'json',
@@ -676,23 +680,19 @@ def resolve_model(ident, force=False):
     current = find_catalog(ident)
     if current and _fresh(current) and not force:
         return current
-    cfg = store.settings()
-    if cfg.get('images_auto', '1') != '1' or cfg.get('images_cache', '1') != '1':
-        return _remember_fallback(ident, 'svg', [], keep_existing=not force)
     candidates = []
     saved = None
     try:
-        if cfg.get('images_unifi', '1') == '1':
-            if catalog_stale() or force:
-                refresh_fingerprint(force=False)
-            result = match_entries(load_index(), ident)
-            candidates = [{
-                'kind': 'unifi', 'id': str(item.get('id') or ''), 'title': item.get('name') or '',
-                'license': '', 'attribution': 'Ubiquiti', 'page': '',
-            } for item in result['candidates']]
-            if result['match']:
-                saved = _download_unifi(ident, result['match'], result['candidates'], result['confidence'])
-        if not saved and cfg.get('images_wikimedia', '1') == '1':
+        if catalog_stale() or force:
+            refresh_fingerprint(force=False)
+        result = match_entries(load_index(), ident)
+        candidates = [{
+            'kind': 'unifi', 'id': str(item.get('id') or ''), 'title': item.get('name') or '',
+            'license': '', 'attribution': 'Ubiquiti', 'page': '',
+        } for item in result['candidates']]
+        if result['match']:
+            saved = _download_unifi(ident, result['match'], result['candidates'], result['confidence'])
+        if not saved:
             saved = _download_wiki(ident)
     except (ImageError, OSError, ValueError):
         saved = None
@@ -750,6 +750,79 @@ def attach(queue):
         store.event('warning', 'Printer image could not be queued')
 
 
+class _NoRedirect(urllib.request.HTTPRedirectHandler):
+    def redirect_request(self, req, fp, code, msg, headers, newurl):
+        return None
+
+
+def _icon_host(host):
+    try:
+        address = ipaddress.ip_address(str(host or '').strip())
+    except ValueError:
+        return ''
+    if not isinstance(address, ipaddress.IPv4Address):
+        return ''
+    return str(address)
+
+
+def _read_device_icon(host, url):
+    parsed = urlsplit(url or '')
+    if parsed.scheme not in ('http', 'https') or parsed.username or parsed.password:
+        return None
+    if (parsed.hostname or '') != host or parsed.port not in (None, 80, 443, 631):
+        return None
+    opener = urllib.request.build_opener(_NoRedirect)
+    request = Request(url, headers={'User-Agent': UA, 'Accept': 'image/png,image/jpeg'})
+    try:
+        with opener.open(request, timeout=4) as response:
+            final = urlsplit(response.geturl())
+            if final.scheme not in ('http', 'https') or (final.hostname or '') != host:
+                return None
+            body = response.read(2_000_001)
+            ctype = (response.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
+    except (HTTPError, URLError, TimeoutError, OSError, ValueError):
+        return None
+    if not body or len(body) > 2_000_000 or not image_ok(body, ctype):
+        return None
+    return body
+
+
+def _download_device_icon(printer, ident):
+    host = _icon_host(printer.get('host') or '')
+    if not host or not ident.get('key'):
+        return None
+    try:
+        from . import printing
+        attrs = printing.ipp_attributes(host)
+    except Exception:
+        return None
+    urls = [item for item in (attrs.get('printer-icons') or []) if isinstance(item, str)]
+    urls.sort(key=lambda item: 0 if item.lower().split('?', 1)[0].endswith('.png') else 1)
+    for url in urls[:4]:
+        body = _read_device_icon(host, url)
+        if not body:
+            continue
+        path = _cache_file(ident['key'])
+        path.write_bytes(body)
+        return _save_catalog({
+            'model_key': ident['key'],
+            'manufacturer': ident['manufacturer'],
+            'model': ident['code'],
+            'source': 'printer',
+            'fingerprint_id': '',
+            'local_path': str(path),
+            'confidence': 1,
+            'license': '',
+            'attribution': 'The printer',
+            'source_page': '',
+            'checked_at': _stamp(),
+            'negative_until': '',
+            'category': ident['category'],
+            'candidates': '[]',
+        })
+    return None
+
+
 def resolve_printer(queue):
     printer = _printer(queue)
     if not printer or (printer.get('image_mode') or 'auto') == 'manual':
@@ -757,11 +830,18 @@ def resolve_printer(queue):
     ident = identity_of(printer)
     if not ident.get('key'):
         return None
-    try:
-        row = resolve_model(ident)
-    except Exception:
-        store.event('warning', 'Printer image lookup could not finish')
-        row = _remember_fallback(ident, 'miss', [])
+    _ICON_TRIED[queue] = _now()
+    current = find_catalog(ident)
+    if current and current.get('source') in ('unifi', 'wikimedia', 'printer', 'upload') and _fresh(current):
+        row = current
+    else:
+        row = _download_device_icon(printer, ident)
+        if not row:
+            try:
+                row = resolve_model(ident)
+            except Exception:
+                store.event('warning', 'Printer image lookup could not finish')
+                row = _remember_fallback(ident, 'miss', [])
     with store.connection() as db:
         db.execute(
             "UPDATE printers SET image_key=? WHERE queue=? AND COALESCE(image_mode,'auto')!='manual'",
@@ -770,18 +850,27 @@ def resolve_printer(queue):
     return row
 
 
+_ICON_TRIED = {}
+
+
 def pending_queues():
     with store.connection() as db:
         rows = [dict(row) for row in db.execute(
             "SELECT * FROM printers WHERE COALESCE(image_mode,'auto')!='manual' ORDER BY queue"
         )]
     due = []
+    now = _now()
     for printer in rows:
         ident = identity_of(printer)
         if not ident.get('key'):
             continue
-        if not _fresh(find_catalog(ident)):
-            due.append(printer['queue'])
+        row = find_catalog(ident)
+        if row and row.get('source') in ('unifi', 'wikimedia', 'printer', 'upload') and _fresh(row):
+            continue
+        tried = _ICON_TRIED.get(printer['queue'])
+        if tried and (now - tried).total_seconds() < 1800:
+            continue
+        due.append(printer['queue'])
     return due
 
 
@@ -835,7 +924,7 @@ def describe(printer):
             'candidates': candidates,
         }
     if not row:
-        pending = bool(ident.get('key')) and store.settings().get('images_auto', '1') == '1'
+        pending = bool(ident.get('key'))
         return {
             'source': 'svg', 'source_label': 'Illustration', 'confidence': 0, 'confident': False,
             'pending': pending, 'attribution': '', 'license': '', 'page': '',
@@ -849,7 +938,7 @@ def describe(printer):
         'source': source,
         'source_label': LABELS.get(source, 'Illustration'),
         'confidence': confidence,
-        'confident': confidence >= 0.9 and source in ('unifi', 'wikimedia', 'upload'),
+        'confident': confidence >= 0.9 and source in ('unifi', 'wikimedia', 'printer', 'upload'),
         'pending': pending,
         'attribution': row.get('attribution') or '',
         'license': row.get('license') or '',
@@ -869,6 +958,25 @@ def media_type(path):
         '.png': 'image/png', '.jpg': 'image/jpeg', '.jpeg': 'image/jpeg',
         '.webp': 'image/webp', '.svg': 'image/svg+xml',
     }.get(Path(path).suffix.lower(), 'application/octet-stream')
+
+
+def email_bytes(queue):
+    """A small PNG of the saved printer photo, for the result email."""
+    path, media = file_for(queue)
+    if media == 'image/svg+xml' or not path or not Path(path).is_file():
+        return None
+    try:
+        with Image.open(path) as src:
+            frame = src.convert('RGB')
+            frame.thumbnail((480, 320))
+            buf = BytesIO()
+            frame.save(buf, 'PNG')
+    except (UnidentifiedImageError, OSError, ValueError):
+        return None
+    data = buf.getvalue()
+    if not data or len(data) > 400_000:
+        return None
+    return data, 'png'
 
 
 def file_for(queue):

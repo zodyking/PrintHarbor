@@ -63,7 +63,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/style.css?v=15">
+  <link rel="stylesheet" href="/static/style.css?v=16">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
@@ -281,30 +281,6 @@
           {% endif %}
         </section>
       </div>
-      <section class="panel" aria-labelledby="printer-images-title">
-        <div class="panelhead"><div><h2 id="printer-images-title">Printer images</h2><p>Each model is identified once and saved on this host. A second printer of the same model reuses that file.</p></div></div>
-        <form method="post" action="/settings/images" class="form-stack">
-          <input type="hidden" name="token" value="{{ token }}">
-          <label class="toggle"><input type="checkbox" name="images_auto" value="1" {% if config.images_auto=='1' %}checked{% endif %}><span><strong>Identify printer images automatically</strong><small>Look up a product image after a printer is added. Printing is not delayed.</small></span></label>
-          <label class="toggle"><input type="checkbox" name="images_unifi" value="1" {% if config.images_unifi=='1' %}checked{% endif %}><span><strong>Use the UniFi device catalog</strong><small>Match the model against the public fingerprint list, then download one image from Ubiquiti. Turn this off to skip that catalog.</small></span></label>
-          <label class="toggle"><input type="checkbox" name="images_wikimedia" value="1" {% if config.images_wikimedia=='1' %}checked{% endif %}><span><strong>Use Wikimedia Commons</strong><small>Only when the file title contains the model and the license is free to reuse.</small></span></label>
-          <label class="toggle"><input type="checkbox" name="images_cache" value="1" {% if config.images_cache=='1' %}checked{% endif %}><span><strong>Keep a local copy</strong><small>Download each model once. Later printers of that model do not contact the catalog again.</small></span></label>
-          <label>Refresh the device catalog after<input type="number" name="images_catalog_days" min="1" max="90" value="{{ config.images_catalog_days or 14 }}" inputmode="numeric"><small>Days before the fingerprint list is downloaded again. A failed refresh keeps the previous list.</small></label>
-          <div class="actions">
-            <button class="button" type="submit" name="action" value="save">Save image settings</button>
-            <button class="button subtle" type="submit" name="action" value="refresh">Refresh catalog</button>
-            <button class="button subtle" type="submit" name="action" value="rescan">Rescan printers</button>
-            <button class="button subtle" type="submit" name="action" value="clear">Clear cache</button>
-          </div>
-        </form>
-        {% if printers %}
-        <ul class="plainlist image-source-list">
-          {% for p in printers %}
-          <li>{{ p.label }}: {{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% else %} · Illustration{% endif %}</li>
-          {% endfor %}
-        </ul>
-        {% endif %}
-      </section>
       <section class="panel" aria-labelledby="cups-status-title">
         <div class="panelhead"><div><h2 id="cups-status-title">CUPS queues</h2><p>Live listing from the local CUPS service.</p></div></div>
         {% if not cups_report.ok %}

@@ -132,6 +132,7 @@ def handle_message(msg, job_prefix, config):
     success = fail = 0
     notes = []
     files = []
+    failure = ''
     for i, (name, data) in enumerate(parts[:max_files]):
         try:
             printing.submit_file(
@@ -143,12 +144,14 @@ def handle_message(msg, job_prefix, config):
             files.append({'name': name, 'detail': f'Accepted for {queue}'})
         except Exception as exc:
             detail = str(exc)[:180]
+            if not failure:
+                failure = detail
             store.event('error', f'Email attachment {name[:90]}: {str(exc)[:230]}')
             notes.append(f'{name}: {detail}')
             files.append({'name': name, 'detail': detail})
             fail += 1
     return {
-        'accepted': True, 'jobs': success, 'errors': fail, 'reason': '', 'queue': queue,
+        'accepted': True, 'jobs': success, 'errors': fail, 'reason': '' if success else failure, 'queue': queue,
         'notes': notes, 'files': files, 'copies': options.get('copies', 1), 'sides': options.get('sides', 'one-sided'),
     }
 
@@ -295,6 +298,7 @@ def reply_context(result):
         'show_files': bool(files),
         'printer': printer if named else '',
         'settings_line': _settings_line(result),
+        'printer_image': bool(result.get('printer_image')),
     }
 
 def render_reply(result):
@@ -331,8 +335,21 @@ def notify_sender(original, config, result):
     if message_id:
         reply['In-Reply-To'] = message_id
         reply['References'] = message_id
-    reply.set_content(result_text(result))
-    reply.add_alternative(render_reply(result), subtype='html')
+    image = None
+    try:
+        from . import images
+        image = images.email_bytes(result.get('queue') or '')
+    except Exception:
+        image = None
+    shown = dict(result)
+    shown['printer_image'] = bool(image)
+    reply.set_content(result_text(shown))
+    reply.add_alternative(render_reply(shown), subtype='html')
+    if image:
+        data, subtype = image
+        reply.get_body(preferencelist=('html',)).add_related(
+            data, maintype='image', subtype=subtype, cid='<printer>',
+        )
     host = (config.get('smtp_host') or 'smtp.gmail.com').strip()
     port = int(config.get('smtp_port') or '587')
     if port == 465:

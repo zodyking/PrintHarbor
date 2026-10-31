@@ -68,6 +68,9 @@
               <p style="margin:0 auto;max-width:420px;font-size:15px;line-height:25px;color:#636a75;text-align:center;">
                 {{ intro }}
               </p>
+              {% if printer_image %}
+              <img src="cid:printer" width="180" alt="{{ printer or 'Printer' }}" style="display:block;margin:28px auto 0;width:180px;max-width:100%;height:auto;border:0;">
+              {% endif %}
             </td>
           </tr>
           <tr>
