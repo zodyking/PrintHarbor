@@ -35,7 +35,7 @@ FINGERPRINT_URL = (
 FINGERPRINT_PATH = (
     '/CANTI-BOT/UniFi-Icon-Browser/main/chrome-extension/data/fingerprint-database.json'
 )
-HOSTS = {'static.ui.com', 'commons.wikimedia.org', 'upload.wikimedia.org'}
+HOSTS = {'static.ui.com', 'commons.wikimedia.org', 'upload.wikimedia.org', 'thumb.wikimedia.org'}
 CATEGORIES = ('mono', 'color', 'mfp', 'inkjet', 'label', 'receipt', 'large', 'generic')
 STATIC = Path(__file__).resolve().parent / 'static' / 'printers'
 QUEUE_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]{0,40}$')
@@ -157,6 +157,8 @@ def identify(text):
             found_codes.append((glued, shown))
         elif re.search(r'[a-z]', compact) and re.search(r'\d', compact) and len(compact) >= 4:
             found_codes.append((compact, token))
+        elif re.fullmatch(r'\d{3,6}', compact):
+            found_codes.append((compact, token))
     if found_codes:
         code, display = max(found_codes, key=lambda item: len(item[0]))
     else:
@@ -223,6 +225,61 @@ def match_entries(entries, ident):
     return {'match': None, 'confidence': 0, 'candidates': near[:6]}
 
 
+def _edits(left, right):
+    if left == right:
+        return 0
+    if not left or not right:
+        return max(len(left), len(right))
+    prev = list(range(len(right) + 1))
+    for i, char in enumerate(left, 1):
+        current = [i]
+        for j, other in enumerate(right, 1):
+            current.append(min(current[-1] + 1, prev[j] + 1, prev[j - 1] + (char != other)))
+        prev = current
+    return prev[-1]
+
+
+def _number_gap(left, right):
+    left_nums = [int(item) for item in re.findall(r'\d+', left or '')]
+    right_nums = [int(item) for item in re.findall(r'\d+', right or '')]
+    if not left_nums or len(left_nums) != len(right_nums):
+        return 10**6
+    return sum(abs(a - b) for a, b in zip(left_nums, right_nums))
+
+
+def nearest_entry(entries, ident):
+    """Closest same-maker catalog row when the exact model is absent."""
+    code = ident.get('code') or ''
+    maker = ident.get('manufacturer') or ''
+    if not code or not maker or len(code) < 4:
+        return None
+    best = None
+    best_key = None
+    for raw in entries:
+        item = _entry(raw)
+        other = item.get('code') or ''
+        if not other or other == code or item.get('manufacturer') != maker or len(other) < 4:
+            continue
+        distance = _edits(code, other)
+        if distance < 1 or distance > 2:
+            continue
+        prefix = 0
+        for left_char, right_char in zip(code, other):
+            if left_char != right_char:
+                break
+            prefix += 1
+        if prefix < max(2, (min(len(code), len(other)) + 1) // 2):
+            continue
+        gap = _number_gap(code, other)
+        if gap > 40:
+            continue
+        key = (distance, gap, other)
+        if best_key is None or key < best_key:
+            best_key = key
+            best = item
+    return best
+
+
 def license_ok(name):
     low = (name or '').lower().replace('_', ' ').replace('-', ' ')
     if not low.strip():
@@ -232,9 +289,12 @@ def license_ok(name):
     return any(token in low for token in ('public domain', 'cc0', 'cc by', 'gfdl'))
 
 
-def wiki_acceptable(title, license_name, code):
+def wiki_acceptable(title, license_name, code, manufacturer=''):
     compact = re.sub(r'[^a-z0-9]', '', (title or '').lower())
     if not code or code not in compact:
+        return False
+    maker = re.sub(r'[^a-z0-9]', '', (manufacturer or '').lower())
+    if maker and maker not in compact:
         return False
     low = (title or '').lower()
     if any(word in low for word in ('logo', 'screenshot', 'icon', 'diagram', 'manual', 'packaging', 'box')):
@@ -275,40 +335,42 @@ def wiki_pages(payload):
     return found
 
 
-def wiki_hits(pages, code):
+def _remote_ok(url):
+    parsed = urlsplit(url or '')
+    if parsed.scheme != 'https' or not parsed.hostname:
+        return False
+    host = parsed.hostname
+    if host == 'raw.githubusercontent.com':
+        return parsed.path == FINGERPRINT_PATH
+    if host == 'thumb.wikimedia.org':
+        return parsed.path.startswith('/wikipedia/commons/')
+    return host in HOSTS
+
+
+def wiki_hits(pages, code, manufacturer=''):
     hits = []
     for page in pages:
-        if not wiki_acceptable(page.get('title') or '', page.get('license') or '', code):
+        if not wiki_acceptable(page.get('title') or '', page.get('license') or '', code, manufacturer):
             continue
-        if urlsplit(page.get('url') or '').hostname in ('upload.wikimedia.org', 'commons.wikimedia.org'):
+        if _remote_ok(page.get('url') or ''):
             hits.append(page)
     return hits
 
 
-def pick_wiki(pages, code):
-    hits = wiki_hits(pages, code)
+def pick_wiki(pages, code, manufacturer=''):
+    hits = wiki_hits(pages, code, manufacturer)
     return hits[0] if hits else None
 
 
 def fetch(url, timeout=8, limit=2_000_000):
     if not network_enabled():
         raise ImageError('Printer image downloads are turned off')
-    parsed = urlsplit(url)
-    if parsed.scheme != 'https' or not parsed.hostname:
-        raise ImageError('Unsupported image address')
-    host = parsed.hostname
-    if host == 'raw.githubusercontent.com':
-        if parsed.path != FINGERPRINT_PATH:
-            raise ImageError('Unsupported image address')
-    elif host not in HOSTS:
+    if not _remote_ok(url):
         raise ImageError('Unsupported image address')
     request = Request(url, headers={'User-Agent': UA, 'Accept': 'image/*,application/json'})
     try:
         with urlopen(request, timeout=timeout) as response:
-            final = urlsplit(response.geturl())
-            if final.scheme != 'https' or final.hostname not in HOSTS | {'raw.githubusercontent.com'}:
-                raise ImageError('The image address changed host')
-            if final.hostname == 'raw.githubusercontent.com' and final.path != FINGERPRINT_PATH:
+            if not _remote_ok(response.geturl()):
                 raise ImageError('The image address changed host')
             body = response.read(limit + 1)
             ctype = (response.headers.get('Content-Type') or '').split(';', 1)[0].strip().lower()
@@ -549,9 +611,10 @@ def _download_unifi(ident, match, candidates, confidence):
         return None
     path = _cache_file(ident['key'])
     path.write_bytes(body)
+    credit = 'Ubiquiti' if confidence >= 0.9 else (match.get('name') or 'Ubiquiti')
     listed = [{
         'kind': 'unifi', 'id': item_id, 'title': match.get('name') or ident['display'],
-        'license': '', 'attribution': 'Ubiquiti', 'page': '',
+        'license': '', 'attribution': credit, 'page': '',
     }]
     _remember_candidate(listed[0]['kind'], item_id, {**listed[0], 'url': url}, body)
     for item in candidates:
@@ -574,7 +637,7 @@ def _download_unifi(ident, match, candidates, confidence):
         'local_path': str(path),
         'confidence': confidence,
         'license': '',
-        'attribution': 'Ubiquiti',
+        'attribution': credit,
         'source_page': '',
         'checked_at': _stamp(),
         'negative_until': '',
@@ -602,7 +665,7 @@ def _wiki_search(ident):
         payload = json.loads(body)
     except (ImageError, OSError, TimeoutError, ValueError, json.JSONDecodeError):
         return None
-    for page in wiki_hits(wiki_pages(payload), ident['code']):
+    for page in wiki_hits(wiki_pages(payload), ident['code'], ident.get('manufacturer') or ''):
         try:
             data, ctype = fetch(page['url'])
         except (ImageError, OSError, TimeoutError):
@@ -694,6 +757,10 @@ def resolve_model(ident, force=False):
             saved = _download_unifi(ident, result['match'], result['candidates'], result['confidence'])
         if not saved:
             saved = _download_wiki(ident)
+        if not saved:
+            near = nearest_entry(load_index(), ident)
+            if near:
+                saved = _download_unifi(ident, near, [], 0.6)
     except (ImageError, OSError, ValueError):
         saved = None
     if saved:
@@ -823,6 +890,32 @@ def _download_device_icon(printer, ident):
     return None
 
 
+def _hold_printer(row):
+    return _save_catalog({
+        'model_key': row['model_key'],
+        'manufacturer': row.get('manufacturer') or '',
+        'model': row.get('model') or '',
+        'source': 'printer',
+        'fingerprint_id': row.get('fingerprint_id') or '',
+        'local_path': row.get('local_path') or '',
+        'confidence': row.get('confidence') or 1,
+        'license': row.get('license') or '',
+        'attribution': row.get('attribution') or 'The printer',
+        'source_page': row.get('source_page') or '',
+        'checked_at': _stamp(),
+        'negative_until': _stamp(_now() + timedelta(days=7)),
+        'category': row.get('category') or 'generic',
+        'candidates': row.get('candidates') or '[]',
+    })
+
+
+def _printer_held(row, now=None):
+    if not row or row.get('source') != 'printer' or not _fresh(row):
+        return False
+    until = _parsed(row.get('negative_until') or '')
+    return bool(until and until > (now or _now()))
+
+
 def resolve_printer(queue):
     printer = _printer(queue)
     if not printer or (printer.get('image_mode') or 'auto') == 'manual':
@@ -832,15 +925,25 @@ def resolve_printer(queue):
         return None
     _ICON_TRIED[queue] = _now()
     current = find_catalog(ident)
-    if current and current.get('source') in ('unifi', 'wikimedia', 'printer', 'upload') and _fresh(current):
+    if current and current.get('source') in ('unifi', 'wikimedia', 'upload') and _fresh(current):
+        row = current
+    elif _printer_held(current):
         row = current
     else:
-        row = _download_device_icon(printer, ident)
-        if not row:
-            try:
-                row = resolve_model(ident)
-            except Exception:
-                store.event('warning', 'Printer image lookup could not finish')
+        try:
+            row = resolve_model(ident, force=True)
+        except Exception:
+            store.event('warning', 'Printer image lookup could not finish')
+            row = None
+        if row and row.get('source') in ('unifi', 'wikimedia', 'upload') and _fresh(row):
+            pass
+        elif row and row.get('source') == 'printer' and _fresh(row):
+            row = _hold_printer(row)
+        else:
+            icon = _download_device_icon(printer, ident)
+            if icon:
+                row = _hold_printer(icon)
+            elif not row or row.get('source') != 'miss':
                 row = _remember_fallback(ident, 'miss', [])
     with store.connection() as db:
         db.execute(
@@ -865,7 +968,9 @@ def pending_queues():
         if not ident.get('key'):
             continue
         row = find_catalog(ident)
-        if row and row.get('source') in ('unifi', 'wikimedia', 'printer', 'upload') and _fresh(row):
+        if row and row.get('source') in ('unifi', 'wikimedia', 'upload') and _fresh(row):
+            continue
+        if _printer_held(row, now):
             continue
         tried = _ICON_TRIED.get(printer['queue'])
         if tried and (now - tried).total_seconds() < 1800:
@@ -874,7 +979,16 @@ def pending_queues():
     return due
 
 
+def _clear_misses():
+    with store.connection() as db:
+        db.execute("DELETE FROM image_catalog WHERE source='miss'")
+
+
 def run_loop():
+    try:
+        _clear_misses()
+    except Exception:
+        store.event('warning', 'Printer image lookup could not finish')
     while not STOP.is_set():
         try:
             while not STOP.is_set() and network_enabled():
@@ -1021,7 +1135,7 @@ def ensure_candidate(kind, item_id):
         except (OSError, json.JSONDecodeError):
             return None
     url = meta.get('url') or ''
-    if urlsplit(url).hostname not in HOSTS:
+    if not _remote_ok(url):
         return None
     try:
         body, ctype = fetch(url)

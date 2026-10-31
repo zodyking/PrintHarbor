@@ -15,7 +15,7 @@ os.environ['PRINTHARBOR_IMAGE_NETWORK']='0'
 _temp=tempfile.TemporaryDirectory(prefix='printharbor-test-')
 os.environ['DATA_DIR']=_temp.name
 
-from app import images, mailer, printing, store, supplies, tailnet
+from app import brother, images, mailer, printing, store, supplies, tailnet
 
 class CoreTests(unittest.TestCase):
     @classmethod
@@ -1090,6 +1090,16 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(canon['code'], images.identify('Canon TS-3522')['code'])
         self.assertEqual(canon['code'], 'ts3522')
         self.assertEqual(canon['category'], 'inkjet')
+        office=images.identify('HP OfficeJet Pro 8710 All-in-One')
+        self.assertEqual(office['manufacturer'], 'hp')
+        self.assertEqual(office['code'], '8710')
+        self.assertEqual(images.identify('HP LaserJet P2055DN')['code'], 'p2055dn')
+        office_match=images.match_entries(
+            [{'id':'2831','name':'HP OfficeJet Pro 8710 All-in-One'}],
+            office,
+        )
+        self.assertEqual(office_match['match']['id'], '2831')
+        self.assertGreaterEqual(office_match['confidence'], 0.9)
         entries=[
             {'id':'3952','name':'Brother HL-L2350DW'},
             {'id':'3953','name':'Brother HL-L2370DW'},
@@ -1106,12 +1116,29 @@ class CoreTests(unittest.TestCase):
         )
         self.assertIsNone(near['match'])
         self.assertGreaterEqual(len(near['candidates']), 1)
+        family=[
+            {'id':'3952','name':'Brother HL-L2350DW'},
+            {'id':'3953','name':'Brother HL-L2370DW'},
+            {'id':'4815','name':'Brother HL-L3210C'},
+        ]
+        closest=images.nearest_entry(family, images.identify('Brother HL-L2380DW series'))
+        self.assertEqual(closest['id'], '3953')
+        only_far=images.nearest_entry(
+            [{'id':'4815','name':'Brother HL-L3210C'}, {'id':'1','name':'HP LaserJet P2055DN'}],
+            images.identify('Brother HL-L2380DW series'),
+        )
+        self.assertIsNone(only_far)
+        self.assertEqual(
+            images.nearest_entry([{'id':'3952','name':'Brother HL-L2350DW'}], images.identify('Brother HL-L2380DW series'))['id'],
+            '3952',
+        )
 
     def test_image_providers_cache_fallbacks_and_overrides(self):
         self._reset_images()
         self._enable_images()
         png=self._png()
         calls=[]
+        real_fetch=images.fetch
 
         def fake(url, timeout=8, limit=2_000_000):
             calls.append(url)
@@ -1222,6 +1249,13 @@ class CoreTests(unittest.TestCase):
                 ]
                 self.assertIsNone(images.pick_wiki(pages[:4], 'hll2350dw'))
                 self.assertEqual(images.pick_wiki(pages, 'hll2350dw')['title'], 'File:Brother HL-L2350DW front.jpg')
+                thumb='https://thumb.wikimedia.org/wikipedia/commons/thumb/1/14/HP_LaserJet_P1102w.jpg/480px-HP_LaserJet_P1102w.jpg'
+                thumb_pages=[
+                    {'title':'File:Widget 8710.jpg','license':'CC BY 4.0','url':thumb,'artist':'','page':'','mime':'image/jpeg'},
+                    {'title':'File:HP OfficeJet Pro 8710.jpg','license':'CC BY 4.0','url':thumb,'artist':'Ada','page':'https://commons.wikimedia.org/wiki/File:HP_OfficeJet_Pro_8710.jpg','mime':'image/jpeg'},
+                ]
+                self.assertIsNone(images.pick_wiki(thumb_pages[:1], '8710', 'hp'))
+                self.assertEqual(images.pick_wiki(thumb_pages, '8710', 'hp')['title'], 'File:HP OfficeJet Pro 8710.jpg')
                 self.assertFalse(images.license_ok('CC BY-ND 2.0'))
                 self.assertTrue(images.license_ok('Public domain'))
 
@@ -1273,11 +1307,30 @@ class CoreTests(unittest.TestCase):
                     images.save_upload('ImgM','bad.svg',b'<svg xmlns="http://www.w3.org/2000/svg"><script>alert(1)</script></svg>')
                 with self.assertRaises(images.ImageError):
                     images.save_upload('ImgM','bad.png',b'not an image')
-                with patch('app.images.urlopen', side_effect=AssertionError('network')):
+                thumb_url='https://thumb.wikimedia.org/wikipedia/commons/thumb/1/14/HP_LaserJet_P1102w.jpg/480px-HP_LaserJet_P1102w.jpg'
+
+                class Thumb:
+                    headers={'Content-Type':'image/jpeg'}
+                    def geturl(self):
+                        return thumb_url
+                    def read(self, _limit):
+                        return png
+                    def __enter__(self):
+                        return self
+                    def __exit__(self, *args):
+                        return False
+
+                with patch('app.images.fetch', real_fetch), patch('app.images.urlopen', return_value=Thumb()):
+                    body, ctype=images.fetch(thumb_url)
+                self.assertEqual(body, png)
+                self.assertEqual(ctype, 'image/jpeg')
+                with patch('app.images.fetch', real_fetch), patch('app.images.urlopen', side_effect=AssertionError('network')):
                     with self.assertRaises(images.ImageError):
                         images.fetch('http://static.ui.com/fingerprint/0/1_257x257.png')
                     with self.assertRaises(images.ImageError):
                         images.fetch('https://example.com/printer.png')
+                    with self.assertRaises(images.ImageError):
+                        images.fetch('https://thumb.wikimedia.org/other/file.jpg')
         finally:
             self._disable_images()
 
@@ -1319,53 +1372,127 @@ class CoreTests(unittest.TestCase):
         self.assertIn('paper jam', jammed['reason'])
         self.assertFalse(jammed['notice'])
         self.assertIn('Cyan Ink is at 4%', jammed['reason'])
+        self.assertEqual(printing.printer_issues(None, online=False), ['The printer is not connected.'])
+        self.assertEqual(printing.printer_issues(None, online=True), [])
+        self.assertEqual(printing.printer_issues({'reasons':['Paper low'],'supplies':[{'name':'Black Toner','percent':40}]}, online=True), [])
+        self.assertEqual(printing.printer_issues({
+            'reasons':[],'supplies':[{'name':'Black Toner','percent':98}],
+            'checks':[{'label':'Low toner','value':'Low','bad':True},{'label':'Door','value':'OK','bad':False}],
+        }, online=True), [])
+        reported=printing.printer_issues({
+            'reasons':[],'health':'Down','supplies':[{'name':'Black Toner','percent':98},{'name':'Drum','percent':94}],
+            'checks':[{'label':'Door','value':'Open','bad':True},{'label':'Health','value':'Down','bad':True}],
+        }, online=True)
+        self.assertEqual(reported, ['A door is open.', 'The printer is down.'])
 
         with store.connection() as db:
             db.execute("INSERT OR REPLACE INTO printers(queue,label,host,protocol,identity) VALUES('LowQ','Office Printer','192.0.2.70','socket','Brother HL-L2380DW series')")
-        printing._NOTICE_AT.pop('LowQ', None)
         calls=[]
 
         def fake_cmd(*args, **kwargs):
             calls.append(args)
             return SimpleNamespace(returncode=0, stdout='request id is LowQ-1 (1 file(s))', stderr='')
 
-        stats={'state':'Idle','reasons':[],'pages':None,'supplies':[{'name':'Black Toner','percent':8}],'serial':'','firmware':''}
+        stats={'state':'Idle','reasons':[],'pages':None,'supplies':[{'name':'Black Toner','percent':8}],'serial':'','firmware':'','checks':[]}
         with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=stats), patch.object(printing,'cmd',side_effect=fake_cmd):
-            with self.assertRaises(printing.PrintError) as caught:
-                printing.submit_file('note.pdf', b'%PDF-1.4', 'LowQ', source='email', sender='person@example.com', dedupe='low-1')
-            with self.assertRaises(printing.PrintError):
-                printing.submit_file('again.pdf', b'%PDF-1.4', 'LowQ', source='email', sender='person@example.com', dedupe='low-2')
-        self.assertIn('8%', str(caught.exception))
-        self.assertEqual(len(calls), 1)
-        self.assertTrue(str(calls[0][-1]).find('notice-') >= 0)
+            printing.submit_file('note.pdf', self._one_page_pdf('note'), 'LowQ', source='email', sender='person@example.com', dedupe='low-1')
+        self.assertEqual(calls, [])
         with store.connection() as db:
             row=db.execute("SELECT status, error FROM jobs WHERE dedupe='low-1'").fetchone()
-        self.assertEqual(row['status'], 'rejected')
+        self.assertEqual(row['status'], 'pending')
         self.assertIn('8%', row['error'])
+        self.assertIn('Waiting:', row['error'])
 
-        calls.clear()
-        printing._NOTICE_AT.pop('LowQ', None)
-        blocked={'state':'Idle','reasons':['Out of paper'],'pages':None,'supplies':[{'name':'Black Toner','percent':40}],'serial':'','firmware':''}
+        blocked={'state':'Idle','reasons':['Out of paper'],'pages':None,'supplies':[{'name':'Black Toner','percent':40}],'serial':'','firmware':'','checks':[]}
         with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=blocked), patch.object(printing,'cmd',side_effect=fake_cmd):
-            with self.assertRaises(printing.PrintError) as paper:
-                printing.submit_file('paper.pdf', b'%PDF-1.4', 'LowQ', dedupe='low-paper')
-        self.assertIn('out of paper', str(paper.exception))
+            printing.submit_file('paper.pdf', self._one_page_pdf('paper'), 'LowQ', dedupe='low-paper')
         self.assertEqual(calls, [])
+        with store.connection() as db:
+            paper=db.execute("SELECT status, error FROM jobs WHERE dedupe='low-paper'").fetchone()
+        self.assertEqual(paper['status'], 'pending')
+        self.assertIn('paper tray is empty', paper['error'])
 
         msg=EmailMessage()
         msg['From']='person@example.com'
         msg['Subject']='PRINT'
+        msg['Message-ID']='<low@example.com>'
         msg.set_content('file')
-        msg.add_attachment(b'%PDF-1.4', maintype='application', subtype='pdf', filename='note.pdf')
+        msg.add_attachment(self._one_page_pdf('mail'), maintype='application', subtype='pdf', filename='note.pdf')
         cfg={'allowed_senders':'','mail_recipient':'','email_pin':'','default_sides':'one-sided','max_files':'5','default_queue':'LowQ','print_email_body':'0'}
         with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=stats), patch.object(printing,'cmd',side_effect=fake_cmd):
             result=mailer.handle_message(msg, 'low-mail', cfg)
-        self.assertEqual(result['jobs'], 0)
-        self.assertIn('8%', result['reason'])
-        html=mailer.render_reply(result)
-        self.assertIn('NOT PRINTED', html)
-        self.assertIn('8%', html)
-        self.assertIn('not printed', html.lower())
+        self.assertEqual(result['jobs'], 1)
+        self.assertTrue(result['held'])
+        self.assertEqual([item['phase'] for item in result['notices']], ['received', 'issue'])
+        received=mailer.render_reply(result['notices'][0])
+        issue=mailer.render_reply(result['notices'][1])
+        self.assertIn('DOCUMENTS RECEIVED', received)
+        self.assertIn('were received', received)
+        self.assertIn('PRINTER NEEDS ATTENTION', issue)
+        self.assertIn('8%', issue)
+        self.assertIn('waiting in the queue', issue)
+        self.assertNotIn('NOT PRINTED', issue)
+        plain=mailer.result_text(result['notices'][1])
+        self.assertIn('8%', plain)
+        self.assertIn('Office Printer', plain)
+
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with TestClient(app) as client:
+            client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+            page=client.get('/?page=jobs')
+        self.assertIn('Waiting:', page.text)
+        self.assertIn('wait-txt', page.text)
+        self.assertIn('>Pending<', page.text)
+
+        ready={'state':'Idle','reasons':[],'pages':None,'supplies':[{'name':'Black Toner','percent':98},{'name':'Drum','percent':94}],'serial':'','firmware':'','health':'Running','checks':[{'label':'Door','value':'OK','bad':False},{'label':'Health','value':'Running','bad':False}]}
+        store.set_setting('reply_enabled', '1')
+        store.set_setting('smtp_from', 'printme@example.com')
+        store.set_setting('imap_user', 'devon@example.com')
+        store.set_setting('imap_password', 'secret-pass')
+        store.set_setting('smtp_host', 'smtp.example.com')
+        store.set_setting('smtp_port', '587')
+
+        class FakeSMTP:
+            def __init__(self, host, port, timeout=None):
+                FakeSMTP.last=self
+                self.message=None
+            def ehlo(self):
+                return None
+            def starttls(self):
+                return None
+            def login(self, user, password):
+                return None
+            def send_message(self, message):
+                self.message=message
+            def quit(self):
+                return None
+
+        with store.connection() as db:
+            db.execute("UPDATE jobs SET status='cancelled' WHERE status='pending' AND IFNULL(dedupe,'')!='low-mail:0'")
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=ready), patch.object(printing,'cmd',side_effect=fake_cmd), patch('app.mailer.smtplib.SMTP', FakeSMTP), patch('app.images.email_bytes', return_value=(b'\x89PNG\r\n', 'png')):
+            printing.release_queues()
+        with store.connection() as db:
+            sent=db.execute("SELECT status FROM jobs WHERE dedupe='low-mail:0'").fetchone()
+        self.assertEqual(sent['status'], 'submitted')
+        self.assertEqual(len(calls), 1)
+        body=FakeSMTP.last.message.get_body(preferencelist=('html',)).get_content()
+        self.assertIn('SENT TO THE PRINTER', body)
+        self.assertIn('It&#39;s being', body)
+        self.assertIn('cid:printer', body)
+
+        ready_msg=EmailMessage()
+        ready_msg['From']='person@example.com'
+        ready_msg['Subject']='PRINT'
+        ready_msg.set_content('file')
+        ready_msg.add_attachment(self._one_page_pdf('ready'), maintype='application', subtype='pdf', filename='ready.pdf')
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=ready), patch.object(printing,'cmd',side_effect=fake_cmd):
+            immediate=mailer.handle_message(ready_msg, 'ready-mail', cfg)
+        self.assertEqual([item['phase'] for item in immediate['notices']], ['received', 'sending'])
+        self.assertFalse(immediate['held'])
+        with store.connection() as db:
+            ready_row=db.execute("SELECT status FROM jobs WHERE dedupe='ready-mail:0'").fetchone()
+        self.assertEqual(ready_row['status'], 'submitted')
 
     def test_result_email_includes_the_printer_photo(self):
         self._reset_images()
@@ -1435,14 +1562,228 @@ class CoreTests(unittest.TestCase):
             def __exit__(self, *args):
                 return False
 
+        def empty(url, timeout=8, limit=2_000_000):
+            if 'fingerprint-database.json' in url:
+                return b'{"1":"Unrelated QQ11"}', 'application/json'
+            if 'commons.wikimedia.org' in url:
+                return json.dumps({'query':{'pages':{}}}).encode(), 'application/json'
+            raise images.ImageError('no art')
+
+        def unifi(url, timeout=8, limit=2_000_000):
+            if 'fingerprint-database.json' in url:
+                return json.dumps({'3952':'Brother HL-L2350DW'}).encode(), 'application/json'
+            if 'static.ui.com' in url and '3952' in url:
+                return png, 'image/png'
+            if 'commons.wikimedia.org' in url:
+                return json.dumps({'query':{'pages':{}}}).encode(), 'application/json'
+            raise images.ImageError('no art')
+
         try:
-            with patch.object(printing,'ipp_attributes',return_value={'printer-icons':['http://192.0.2.72/icon.png']}), patch('app.images.urllib.request.build_opener') as build:
+            with patch('app.images.fetch', side_effect=empty), patch.object(printing,'ipp_attributes',return_value={'printer-icons':['http://192.0.2.72/icon.png']}), patch('app.images.urllib.request.build_opener') as build:
                 build.return_value.open.return_value=Resp()
                 row=images.resolve_printer('IconQ')
             self.assertEqual(row['source'], 'printer')
+            self.assertTrue(row['negative_until'])
             self.assertTrue(Path(row['local_path']).is_file())
             self.assertEqual(images.file_for('IconQ')[1], 'image/png')
+            images._ICON_TRIED.clear()
+            self.assertNotIn('IconQ', images.pending_queues())
+
+            self._reset_images()
+            with store.connection() as db:
+                db.execute("INSERT OR REPLACE INTO printers(queue,label,host,protocol,identity) VALUES('IconQ','Office','192.0.2.72','socket','Brother HL-L2350DW series')")
+            images._remember_fallback(images.identify('Brother HL-L2350DW series'), 'miss', [])
+            with patch('app.images.fetch', side_effect=unifi), patch.object(printing,'ipp_attributes',return_value={'printer-icons':['http://192.0.2.72/icon.png']}), patch('app.images.urllib.request.build_opener') as build:
+                build.return_value.open.return_value=Resp()
+                chosen=images.resolve_printer('IconQ')
+            self.assertEqual(chosen['source'], 'unifi')
+            self.assertEqual(chosen['fingerprint_id'], '3952')
+            build.return_value.open.assert_not_called()
+
+            self._reset_images()
+            images._remember_fallback(images.identify('Brother HL-L2350DW series'), 'miss', [], keep_existing=False)
+            images.STOP.set()
+            images.run_loop()
+            self.assertIsNone(images.find_catalog(images.identify('Brother HL-L2350DW series')))
         finally:
             self._disable_images()
+
+    def test_missing_model_uses_the_nearest_unifi_image(self):
+        self._reset_images()
+        self._enable_images()
+        png=self._png()
+
+        def fake(url, timeout=8, limit=2_000_000):
+            if 'fingerprint-database.json' in url:
+                return json.dumps({
+                    '3952':'Brother HL-L2350DW',
+                    '4815':'Brother HL-L3210C',
+                }).encode(), 'application/json'
+            if 'static.ui.com' in url and '3952' in url:
+                return png, 'image/png'
+            if 'commons.wikimedia.org' in url:
+                return json.dumps({'query':{'pages':{}}}).encode(), 'application/json'
+            raise images.ImageError('unexpected address')
+
+        try:
+            with patch('app.images.fetch', side_effect=fake):
+                row=images.resolve_model(images.identify('Brother HL-L2350DW series'), force=True)
+                self.assertEqual(row['fingerprint_id'], '3952')
+                self.assertGreaterEqual(row['confidence'], 0.9)
+                self._reset_images()
+                near=images.resolve_model(images.identify('Brother HL-L2380DW series'), force=True)
+            self.assertEqual(near['source'], 'unifi')
+            self.assertEqual(near['model_key'], 'brother|hll2380dw')
+            self.assertEqual(near['fingerprint_id'], '3952')
+            self.assertLess(near['confidence'], 0.9)
+            self.assertIn('2350', near['attribution'].lower())
+            self.assertTrue(Path(near['local_path']).is_file())
+        finally:
+            self._disable_images()
+
+    def test_brother_snmp_readings_match_the_maintenance_record(self):
+        def packed(*words):
+            return bytes.fromhex(''.join(words) + 'ff')
+
+        def sensor(kind, number, percent=False):
+            value = number * 100 if percent else number
+            return f'{kind}0104{value:08x}'
+
+        values = {
+            brother.OID_MODEL: b'MDL:HL-L2380DW',
+            brother.OID_SERIAL: b'E12345',
+            brother.OID_COUNTERS: packed(sensor('00', 783)),
+            brother.OID_MAINTENANCE: packed(
+                sensor('11', 783),
+                sensor('41', 94, percent=True),
+                sensor('6f', 98, percent=True),
+                sensor('81', 70),
+            ),
+            brother.OID_NEXTCARE: packed(sensor('82', 11217)),
+            brother.OID_DEVICE: 2,
+            brother.OID_PRINTER: 3,
+            brother.OID_ERRORS: b'\x00\x00',
+        }
+        live = brother.snapshot(values, 'Brother HL-L2380DW series')
+        self.assertEqual(live['supplies'], [
+            {'name': 'Black Toner', 'percent': 98},
+            {'name': 'Drum', 'percent': 94},
+        ])
+        self.assertEqual(live['pages'], 783)
+        self.assertEqual(live['state'], 'Idle')
+        self.assertEqual(live['health'], 'Running')
+        self.assertEqual(live['reasons'], [])
+        labels = {row['label']: row['value'] for row in live['checks']}
+        self.assertEqual(labels['Status'], 'Idle')
+        self.assertEqual(labels['Health'], 'Running')
+        self.assertEqual(labels['Door'], 'OK')
+        self.assertEqual(labels['Low toner'], 'OK')
+        self.assertEqual(labels['No paper'], 'OK')
+        self.assertEqual(labels['Paper jam'], 'OK')
+        self.assertEqual(labels['Drum pages'], '783')
+        self.assertEqual(labels['Drum pages left'], '11,217')
+        self.assertIsNone(printing.supply_problem(live))
+
+        jammed = dict(values)
+        jammed[brother.OID_ERRORS] = b'\x04\x00'
+        jam = brother.snapshot(jammed, 'Brother HL-L2380DW')
+        self.assertEqual(jam['reasons'], ['Paper jam'])
+        self.assertIn('paper jam', printing.supply_problem(jam)['reason'].lower())
+
+        low_flag = dict(values)
+        low_flag[brother.OID_ERRORS] = b'\x20\x00'
+        flagged = brother.snapshot(low_flag, 'Brother HL-L2380DW')
+        self.assertEqual(flagged['supplies'][0]['percent'], 98)
+        self.assertIsNone(printing.supply_problem(flagged))
+        self.assertEqual({row['label']: row['value'] for row in flagged['checks']}['Low toner'], 'Low')
+
+        door = dict(values)
+        door[brother.OID_ERRORS] = b'\x08\x00'
+        opened = brother.snapshot(door, 'Brother HL-L2380DW')
+        self.assertEqual(opened['reasons'], [])
+        self.assertEqual({row['label']: row['value'] for row in opened['checks']}['Door'], 'Open')
+        self.assertIsNone(printing.supply_problem(opened))
+
+        empty = dict(values)
+        empty[brother.OID_MAINTENANCE] = packed(sensor('6f', 8, percent=True), sensor('41', 94, percent=True))
+        low = brother.snapshot(empty, 'Brother HL-L2380DW')
+        self.assertIn('8%', printing.supply_problem(low)['reason'])
+
+        legacy = packed('a101020414', 'a201020c14')
+        old = brother.snapshot({
+            brother.OID_MODEL: b'MDL:HL-2140',
+            brother.OID_MAINTENANCE: legacy,
+        }, 'Brother HL-2140')
+        self.assertEqual(old['supplies'][0], {'name': 'Black Toner', 'percent': 20})
+        self.assertEqual(old['supplies'][1], {'name': 'Cyan Toner', 'percent': 60})
+        self.assertIsNone(brother.snapshot({brother.OID_MODEL: b'MDL:MFC-8660DN'}))
+
+        request_id, status, index, decoded = brother.decode_message(self._snmp_reply([
+            (brother.OID_MODEL, b'MDL:HL-L2380DW'),
+            (brother.OID_PRINTER, 3),
+        ]))
+        self.assertEqual((request_id, status, index), (1, 0, 0))
+        self.assertEqual(decoded[brother.OID_MODEL], b'MDL:HL-L2380DW')
+        self.assertEqual(decoded[brother.OID_PRINTER], 3)
+        encoded = brother._oid(brother.OID_MAINTENANCE)
+        self.assertEqual(brother._decode_oid(encoded[2:]), brother.OID_MAINTENANCE)
+
+        class Sock:
+            calls = 0
+            def __init__(self, *args, **kwargs):
+                return None
+            def __enter__(self):
+                return self
+            def __exit__(self, *args):
+                return False
+            def settimeout(self, _timeout):
+                return None
+            def sendto(self, data, address):
+                Sock.calls += 1
+                self.last = data
+            def recvfrom(self, _size):
+                if Sock.calls == 1:
+                    return self_reply([(brother.OID_MODEL, b'MDL:HL-L2380DW')], status=2, index=1), ('192.0.2.40', 161)
+                return self_reply([(brother.OID_SERIAL, b'E12345')]), ('192.0.2.40', 161)
+
+        def self_reply(pairs, status=0, index=0):
+            return CoreTests._snmp_reply(pairs, status, index)
+
+        with patch('app.brother.socket.socket', Sock):
+            reply = brother.snmp_get('192.0.2.40', [brother.OID_MODEL, brother.OID_SERIAL])
+        self.assertEqual(reply[brother.OID_SERIAL], b'E12345')
+        self.assertNotIn(brother.OID_MODEL, reply)
+
+        extra = live
+        with patch.object(printing, 'ipp_attributes', return_value={}), patch.object(printing, '_snmp_lines', return_value=None), patch.object(brother, 'readings', return_value=extra) as asked:
+            merged = printing.printer_stats('192.0.2.40', 'Brother HL-L2380DW series')
+            printing.printer_stats('192.0.2.40')
+        self.assertEqual(asked.call_count, 1)
+        self.assertEqual(merged['supplies'][0]['percent'], 98)
+        self.assertEqual(merged['pages_label'], '783')
+        self.assertEqual(merged['checks'][0]['value'], 'Idle')
+
+        with store.connection() as db:
+            db.execute("INSERT OR REPLACE INTO printers(queue,label,host,protocol,identity) VALUES('BrotherQ','Office Printer','192.0.2.77','socket','Brother HL-L2380DW series')")
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with patch.object(printing, 'printer_reachable', return_value=True), patch.object(printing, 'printer_stats', return_value=merged):
+            with TestClient(app) as client:
+                client.post('/login', data={'username': 'admin', 'password': os.environ['ADMIN_PASSWORD']}, follow_redirects=False)
+                page = client.get('/?page=printers')
+        self.assertIn('Drum pages left', page.text)
+        self.assertIn('11,217', page.text)
+        self.assertIn('98%', page.text)
+        self.assertIn('>Door<', page.text)
+        self.assertIn('>Idle<', page.text)
+
+    @staticmethod
+    def _snmp_reply(pairs, status=0, index=0):
+        binds = b''
+        for oid, value in pairs:
+            payload = brother._integer(value) if isinstance(value, int) else brother._tlv(0x04, value)
+            binds += brother._tlv(0x30, brother._oid(oid) + payload)
+        pdu = brother._tlv(0xA2, brother._integer(1) + brother._integer(status) + brother._integer(index) + brother._tlv(0x30, binds))
+        return brother._tlv(0x30, brother._integer(0) + brother._tlv(0x04, b'public') + pdu)
 
 if __name__=='__main__': unittest.main()

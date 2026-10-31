@@ -33,10 +33,12 @@ def snapshot():
     with _LOCK:
         return dict(LAST)
 
-def summarize_poll(count, problems):
+def summarize_poll(count, problems, waiting=0):
     if problems:
         total = count or problems
         return 'Attention', f'{problems} of {total} new messages were rejected or failed'
+    if waiting:
+        return 'Watching', f'{waiting} new message(s) are waiting for the printer'
     if count:
         return 'Healthy', f'Printed {count} new message(s) from the folder'
     return 'Watching', 'Watching the folder for new mail'
@@ -133,15 +135,20 @@ def handle_message(msg, job_prefix, config):
     notes = []
     files = []
     failure = ''
+    created = False
     for i, (name, data) in enumerate(parts[:max_files]):
+        dedupe = f'{job_prefix}:{i}'
+        with store.connection() as db:
+            existing = db.execute('SELECT id FROM jobs WHERE dedupe=?', (dedupe,)).fetchone()
         try:
             printing.submit_file(
                 name, data, queue, source='email', sender=sender,
-                dedupe=f'{job_prefix}:{i}', **options,
+                dedupe=dedupe, release=False, **options,
             )
             success += 1
-            notes.append(f'{name} accepted by CUPS for {queue}')
-            files.append({'name': name, 'detail': f'Accepted for {queue}'})
+            created = created or not existing
+            notes.append(f'{name} received for {queue}')
+            files.append({'name': name, 'detail': 'Received'})
         except Exception as exc:
             detail = str(exc)[:180]
             if not failure:
@@ -150,10 +157,30 @@ def handle_message(msg, job_prefix, config):
             notes.append(f'{name}: {detail}')
             files.append({'name': name, 'detail': detail})
             fail += 1
-    return {
+    base = {
         'accepted': True, 'jobs': success, 'errors': fail, 'reason': '' if success else failure, 'queue': queue,
         'notes': notes, 'files': files, 'copies': options.get('copies', 1), 'sides': options.get('sides', 'one-sided'),
+        'held': False, 'notices': [], 'issues': [],
     }
+    if not success or not created:
+        return base
+    remember_batch(job_prefix, sender, str(msg.get('Subject') or ''), str(msg.get('Message-ID') or ''), queue)
+    received = _phase_notice(base, 'received')
+    printing.release_queues()
+    if _jobs_with_status(job_prefix, 'submitted'):
+        set_batch_phase(job_prefix, 'sent')
+        base['notices'] = [received, _phase_notice(base, 'sending')]
+        return base
+    if not _jobs_with_status(job_prefix, 'pending'):
+        return base
+    block = printing.printer_block(queue) or {'issues': ['The printer is not ready.']}
+    set_batch_phase(job_prefix, 'held')
+    printing._mark_waiting(queue, block['issues'])
+    base['held'] = True
+    base['issues'] = block['issues']
+    base['reason'] = ' '.join(block['issues'])
+    base['notices'] = [received, _phase_notice(base, 'issue', block['issues'])]
+    return base
 
 def reply_template():
     global _REPLY
@@ -199,10 +226,17 @@ def customer_line(text):
     return raw
 
 def printer_name(queue):
-    name = (queue or '').replace('_', ' ').strip()
-    if not name or name == '—':
+    target = (queue or '').strip()
+    if not target or target == '—':
         return 'your printer'
-    return name
+    try:
+        with store.connection() as db:
+            row = db.execute('SELECT label FROM printers WHERE queue=?', (target,)).fetchone()
+        if row and str(row['label']).strip():
+            return str(row['label']).strip()[:100]
+    except Exception:
+        pass
+    return target.replace('_', ' ').strip() or 'your printer'
 
 def _file_row(name, description):
     clean = str(name or 'File')
@@ -245,20 +279,142 @@ def _files_are(count):
         return 'Your file is'
     return f'Your {count} files are'
 
+def _phase_notice(base, phase, issues=None):
+    notice = dict(base)
+    notice['phase'] = phase
+    notice['issues'] = list(issues or [])
+    notice['notices'] = []
+    detail = {
+        'received': 'Received',
+        'sending': 'Sending to the printer',
+        'issue': 'Waiting for the printer',
+    }[phase]
+    files = []
+    for item in base.get('files') or []:
+        row = dict(item)
+        if row.get('detail') == 'Received':
+            row['detail'] = detail
+        files.append(row)
+    notice['files'] = files
+    if phase == 'issue':
+        notice['reason'] = ' '.join(issues or [])
+    return notice
+
+
+def _jobs_with_status(prefix, status):
+    with store.connection() as db:
+        rows = db.execute('SELECT dedupe, status FROM jobs').fetchall()
+    head = f'{prefix}:'
+    return any((row['dedupe'] or '').startswith(head) and row['status'] == status for row in rows)
+
+
+def remember_batch(prefix, sender, subject, message_id, queue):
+    with store.connection() as db:
+        db.execute(
+            '''INSERT OR IGNORE INTO mail_batches(prefix, sender, subject, message_id, queue, phase)
+               VALUES(?,?,?,?,?,'new')''',
+            (prefix, str(sender or '')[:200], str(subject or '')[:300], str(message_id or '')[:300], queue or ''),
+        )
+
+
+def set_batch_phase(prefix, phase):
+    with store.connection() as db:
+        db.execute('UPDATE mail_batches SET phase=? WHERE prefix=?', (phase, prefix))
+
+
+def note_dispatched(record):
+    """After a held email job is sent, confirm that it is on the way."""
+    if not record or (record['source'] or '') != 'email':
+        return
+    dedupe = record['dedupe'] or ''
+    if ':' not in dedupe:
+        return
+    prefix = dedupe.rsplit(':', 1)[0]
+    with store.connection() as db:
+        batch = db.execute('SELECT * FROM mail_batches WHERE prefix=?', (prefix,)).fetchone()
+        if not batch or batch['phase'] != 'held':
+            return
+        claimed = db.execute(
+            "UPDATE mail_batches SET phase='sent' WHERE prefix=? AND phase='held'",
+            (prefix,),
+        ).rowcount
+        rows = db.execute('SELECT filename, copies, sides, queue, dedupe FROM jobs').fetchall()
+    if not claimed:
+        return
+    head = prefix + ':'
+    matched = [row for row in rows if (row['dedupe'] or '').startswith(head)]
+    original = EmailMessage()
+    original['From'] = batch['sender']
+    original['Subject'] = batch['subject'] or 'Print job'
+    if batch['message_id']:
+        original['Message-ID'] = batch['message_id']
+    first = matched[0] if matched else None
+    result = {
+        'accepted': True,
+        'jobs': len(matched) or 1,
+        'errors': 0,
+        'reason': '',
+        'queue': batch['queue'] or (first['queue'] if first else ''),
+        'phase': 'sending',
+        'issues': [],
+        'notes': [],
+        'files': [{'name': row['filename'], 'detail': 'Sending to the printer'} for row in matched],
+        'copies': first['copies'] if first else 1,
+        'sides': first['sides'] if first else 'one-sided',
+    }
+    try:
+        notify_sender(original, store.settings(), result)
+    except Exception as exc:
+        store.event('warning', 'The sending confirmation could not be emailed: ' + str(exc)[:180])
+
+
 def reply_context(result):
     printer = printer_name(result.get('queue'))
     named = printer != 'your printer'
     jobs = result.get('jobs') or 0
     errors = result.get('errors') or 0
     reason = customer_line(result.get('reason') or "We couldn't print this.")
-    if not result.get('accepted') or not jobs:
-        outcome = 'rejected'
-    elif errors:
-        outcome = 'partial'
-    else:
-        outcome = 'accepted'
+    phase = result.get('phase') or ''
+    issues = [str(item) for item in (result.get('issues') or []) if str(item).strip()]
     where = printer if named else 'the printer'
-    if outcome == 'accepted':
+    if phase == 'received':
+        outcome = 'received'
+        eyebrow = 'DOCUMENTS RECEIVED'
+        hero = ('Your documents', 'were received.')
+        intro = f'{_files_are(jobs)} here. The printer is checked before anything is sent.'
+        card_label = 'PRINTER'
+        card_value = printer if named else 'Your printer'
+        card_note = 'Nothing is sent until the printer looks ready.'
+        preview = f'Your documents were received for {card_value}.'
+    elif phase == 'sending':
+        outcome = 'sending'
+        eyebrow = 'SENT TO THE PRINTER'
+        hero = ("It's being", 'sent.')
+        intro = f'{_files_are(jobs)} being sent to {where}.'
+        card_label = 'PRINTER'
+        card_value = printer if named else 'Your printer'
+        card_note = 'Pick up your pages there.'
+        preview = f'Your documents are being sent to {card_value}.'
+    elif phase == 'issue':
+        outcome = 'issue'
+        eyebrow = 'PRINTER NEEDS ATTENTION'
+        hero = ('The printer', 'needs attention.')
+        intro = 'Your documents are waiting in the queue. They will be sent when the printer is ready.'
+        card_label = 'PRINTER'
+        card_value = printer if named else 'Your printer'
+        card_note = 'These stay in the queue until every reported reading looks ready.'
+        preview = 'The printer needs attention. ' + ' '.join(issues)
+    else:
+        if not result.get('accepted') or not jobs:
+            outcome = 'rejected'
+        elif errors:
+            outcome = 'partial'
+        else:
+            outcome = 'accepted'
+        where = printer if named else 'the printer'
+    if phase in ('received', 'sending', 'issue'):
+        pass
+    elif outcome == 'accepted':
         eyebrow = 'PRINT CONFIRMED'
         hero = ("It's on", 'the way.')
         intro = f'{_files_are(jobs)} on the way to {where}.'
@@ -294,6 +450,7 @@ def reply_context(result):
         'card_label': card_label,
         'card_value': card_value,
         'card_note': card_note,
+        'issues': issues,
         'files': files,
         'show_files': bool(files),
         'printer': printer if named else '',
@@ -311,6 +468,8 @@ def result_text(result):
         lines += ['', ctx['card_value']]
     elif ctx['printer']:
         lines += ['', f"Printer: {ctx['printer']}"]
+    for item in ctx.get('issues') or []:
+        lines.append(item)
     for item in ctx['files']:
         lines.append(f"{item['name']} — {item['description']}")
     if ctx['settings_line']:
@@ -573,7 +732,7 @@ def take_new(conn, config, folder):
     if not pending:
         publish(state='Watching', detail=f'Watching {folder} for new mail.')
         return False
-    count = problems = 0
+    count = problems = waiting = 0
     for uid in pending:
         uid_text = uid.decode() if isinstance(uid, bytes) else str(uid)
         status, response = conn.uid('fetch', uid, '(BODY.PEEK[])')
@@ -589,18 +748,21 @@ def take_new(conn, config, folder):
             result = handle_message(msg, key, config)
             if (not result['accepted']) or result['errors']:
                 problems += 1
-            try:
-                notify_sender(msg, config, result)
-            except Exception as exc:
-                secret = config.get('imap_password') or ''
-                store.event('error', 'Result email failed: ' + str(exc).replace(secret, '')[:300])
+            elif result.get('held'):
+                waiting += 1
+            secret = config.get('imap_password') or ''
+            for notice in result.get('notices') or [result]:
+                try:
+                    notify_sender(msg, config, notice)
+                except Exception as exc:
+                    store.event('error', 'Result email failed: ' + str(exc).replace(secret, '')[:300])
         try:
             conn.uid('store', uid, '+FLAGS', '(\\Seen)')
         except Exception:
             store.event('warning', 'Could not mark a handled email as seen')
         store.set_setting('mail_last_uid', uid_text)
         count += 1
-    state, detail = summarize_poll(count, problems)
+    state, detail = summarize_poll(count, problems, waiting)
     publish(state=state, detail=detail)
     return len(pending) >= 35
 

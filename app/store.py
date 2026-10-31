@@ -82,6 +82,15 @@ def initialize():
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             created_at TEXT DEFAULT CURRENT_TIMESTAMP, level TEXT, message TEXT
         );
+        CREATE TABLE IF NOT EXISTS mail_batches (
+            prefix TEXT PRIMARY KEY,
+            sender TEXT DEFAULT '',
+            subject TEXT DEFAULT '',
+            message_id TEXT DEFAULT '',
+            queue TEXT DEFAULT '',
+            phase TEXT DEFAULT 'new',
+            created_at TEXT DEFAULT CURRENT_TIMESTAMP
+        );
         CREATE TABLE IF NOT EXISTS image_catalog (
             model_key TEXT PRIMARY KEY,
             manufacturer TEXT DEFAULT '',

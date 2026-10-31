@@ -53,6 +53,14 @@
       <dt>Jam</dt>
       <dd><strong>{{ jam_word.get(jam, 'Not reported') }}</strong></dd>
     </div>
+    {% if p.stats and p.stats.checks %}
+    {% for row in p.stats.checks %}
+    <div class="read{% if row.bad %} is-bad{% endif %}">
+      <dt>{{ row.label }}</dt>
+      <dd><strong>{{ row.value }}</strong></dd>
+    </div>
+    {% endfor %}
+    {% endif %}
   </dl>
 </div>
 {% endmacro %}
@@ -63,7 +71,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/style.css?v=16">
+  <link rel="stylesheet" href="/static/style.css?v=18">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
@@ -150,7 +158,7 @@
         {% if jobs %}
         <div class="table-scroll"><table aria-labelledby="recent-jobs-title"><thead><tr><th scope="col">Document</th><th scope="col">Source</th><th scope="col">Printer</th><th scope="col">Pages</th><th scope="col">Status</th></tr></thead><tbody>
           {% for j in jobs[:7] %}
-          <tr><td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC</small>{% if j.error %}<small class="error-txt">{{ j.error }}</small>{% endif %}</td><td>{{ j.source|title }}</td><td>{{ j.queue }}</td><td>{{ j.pages or '—' }}</td><td><span class="status {{ job_class.get(j.status, 'neutral') }}">{{ job_labels.get(j.status, j.status) }}</span></td></tr>
+          <tr><td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC</small>{% if j.error %}<small class="{{ 'wait-txt' if j.status=='pending' else 'error-txt' }}">{{ j.error }}</small>{% endif %}</td><td>{{ j.source|title }}</td><td>{{ j.queue }}</td><td>{{ j.pages or '—' }}</td><td><span class="status {{ job_class.get(j.status, 'neutral') }}">{{ job_labels.get(j.status, j.status) }}</span></td></tr>
           {% endfor %}
         </tbody></table></div>
         {% else %}
@@ -335,14 +343,14 @@
         </div>
       </section>
     {% elif page=='jobs' %}
-      <div class="headerline"><div><h1>Print jobs</h1><p class="muted">Received documents wait in the printer queue. Each one is sent only after a quick check that the printer is online.</p></div></div>
+      <div class="headerline"><div><h1>Print jobs</h1><p class="muted">Received documents wait in the printer queue. Each one is sent when the printer is connected and the readings it reports look ready.</p></div></div>
       <section class="panel" aria-labelledby="job-log-title">
-        <div class="panelhead"><div><h2 id="job-log-title">Job log</h2><p>Rejected mail stays in this log with the reason. Pending documents print in order when the printer is back online. A document already sent cannot be cancelled.</p></div><span class="chip">{{ jobs|length }} recent jobs</span></div>
+        <div class="panelhead"><div><h2 id="job-log-title">Job log</h2><p>Rejected mail stays in this log with the reason. Pending documents stay in order until toner, paper, jam, door, and health readings that the printer reports look ready. A document already sent cannot be cancelled.</p></div><span class="chip">{{ jobs|length }} recent jobs</span></div>
         {% if jobs %}
         <div class="table-scroll"><table aria-labelledby="job-log-title"><thead><tr><th scope="col">Document</th><th scope="col">Sender</th><th scope="col">Target</th><th scope="col">Pages</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead><tbody>
           {% for j in jobs %}
           <tr>
-            <td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC · {{ side_labels.get(j.sides, j.sides) }}</small>{% if j.error %}<small class="error-txt">{{ j.error }}</small>{% endif %}</td>
+            <td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC · {{ side_labels.get(j.sides, j.sides) }}</small>{% if j.error %}<small class="{{ 'wait-txt' if j.status=='pending' else 'error-txt' }}">{{ j.error }}</small>{% endif %}</td>
             <td>{{ j.sender or j.source|title }}</td>
             <td>{{ j.queue }}{% if j.cups_id %}<small>{{ j.cups_id }}</small>{% endif %}</td>
             <td>{{ j.pages or '—' }} × {{ j.copies }}</td>

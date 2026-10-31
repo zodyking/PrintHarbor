@@ -87,6 +87,13 @@
                     <div style="font-size:12px;line-height:20px;color:#767d89;">
                       {{ card_note }}
                     </div>
+                    {% if issues %}
+                    <div style="padding-top:18px;text-align:left;">
+                      {% for item in issues %}
+                      <div style="padding:4px 0;font-size:14px;line-height:22px;color:#17191f;">{{ item }}</div>
+                      {% endfor %}
+                    </div>
+                    {% endif %}
                   </td>
                 </tr>
               </table>
