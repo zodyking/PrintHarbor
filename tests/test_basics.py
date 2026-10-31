@@ -13,7 +13,7 @@ os.environ['ADMIN_PASSWORD']='test-only-admin-password-not-public'
 _temp=tempfile.TemporaryDirectory(prefix='printharbor-test-')
 os.environ['DATA_DIR']=_temp.name
 
-from app import mailer, printing, store, tailnet
+from app import mailer, printing, store, supplies, tailnet
 
 class CoreTests(unittest.TestCase):
     @classmethod
@@ -225,6 +225,50 @@ class CoreTests(unittest.TestCase):
         payload+=len('Brother HL-L2380DW').to_bytes(2,'big')+b'Brother HL-L2380DW'+b'\x03'
         parsed=printing.parse_ipp(b'HTTP/1.1 200 OK\r\n\r\n'+payload)
         self.assertEqual(parsed['printer-make-and-model'],['Brother HL-L2380DW'])
+        numbers=b'\x02\x00\x00\x00\x00\x00\x00\x01\x04'
+        numbers+=bytes([0x23])+len('printer-state').to_bytes(2,'big')+b'printer-state'+(4).to_bytes(2,'big')+(4).to_bytes(4,'big')
+        numbers+=bytes([0x21])+len('marker-levels').to_bytes(2,'big')+b'marker-levels'+(4).to_bytes(2,'big')+(-1).to_bytes(4,'big',signed=True)
+        numbers+=bytes([0x22])+len('printer-is-accepting-jobs').to_bytes(2,'big')+b'printer-is-accepting-jobs'+(1).to_bytes(2,'big')+b'\x00'
+        numbers+=b'\x03'
+        numbered=printing.parse_ipp(numbers)
+        self.assertEqual(numbered['printer-state'],[4])
+        self.assertEqual(numbered['marker-levels'],[-1])
+        self.assertEqual(numbered['printer-is-accepting-jobs'],[False])
+        self.assertEqual(printing.supply_percent(36,100),36)
+        self.assertEqual(printing.supply_percent(20,200),10)
+        self.assertEqual(printing.supply_percent(0,100),0)
+        self.assertIsNone(printing.supply_percent(-1,100))
+        self.assertIsNone(printing.supply_percent(-3,100))
+        ipp=printing.readings_from_ipp({
+            'printer-state':[5],
+            'printer-state-reasons':['media-jam','none','toner-low'],
+            'printer-is-accepting-jobs':[False],
+            'marker-names':['Black Toner'],
+            'marker-levels':[36,-1],
+            'marker-high-levels':[100,100],
+            'printer-firmware-string':['1.23'],
+            'printer-device-id':['MFG:Brother;MDL:HL-L2380DW;SN:E12345;'],
+        })
+        self.assertEqual(ipp['state'],'Stopped')
+        self.assertEqual(ipp['reasons'],['Paper jam','Toner low','Not accepting jobs'])
+        self.assertEqual(ipp['supplies'],[{'name':'Black Toner','percent':36}])
+        self.assertEqual(ipp['serial'],'E12345')
+        self.assertEqual(ipp['firmware'],'1.23')
+        snmp_lines=['8421','"BRN123"','4','Black Toner Cartridge','100','40','No Such Instance currently exists at this OID','No Such Instance currently exists at this OID','No Such Instance currently exists at this OID','Drum Unit','100','80']
+        self.assertEqual(len(snmp_lines), len(printing.SNMP_OIDS))
+        snmp=printing.readings_from_snmp(snmp_lines)
+        self.assertEqual(snmp['pages'],8421)
+        self.assertEqual(snmp['serial'],'BRN123')
+        self.assertEqual(snmp['state'],'Printing')
+        self.assertEqual(snmp['supplies'][0],{'name':'Black Toner Cartridge','percent':40})
+        self.assertEqual(snmp['supplies'][1]['name'],'Drum Unit')
+        self.assertEqual(snmp['supplies'][1]['percent'],80)
+        with patch.object(printing,'ipp_attributes',return_value={}), patch.object(printing,'_snmp_lines',return_value=snmp_lines):
+            live=printing.printer_stats('192.0.2.40')
+        self.assertEqual(live['pages_label'],'8,421')
+        self.assertEqual(live['supplies'][1]['name'],'Drum Unit')
+        with patch.object(printing,'ipp_attributes',return_value={}), patch.object(printing,'_snmp_lines',return_value=None):
+            self.assertIsNone(printing.printer_stats('192.0.2.40'))
         listed='\n'.join([
             'PageSize/Media Size: Letter *A4',
             'brlaserEconomode/Toner save mode: *True False',
@@ -236,6 +280,80 @@ class CoreTests(unittest.TestCase):
             ('brlaserDensityAdjust','106'),
         ])
         self.assertEqual(printing.density_options('PageSize/Media Size: *Letter'),[])
+
+    def test_model_picks_a_toner_and_an_amazon_search(self):
+        brother=supplies.replacement_for('Brother HL-L2380DW series')
+        self.assertEqual(brother['kind'],'Toner')
+        self.assertEqual(brother['name'],'TN660')
+        self.assertIn('TN630', brother['note'])
+        self.assertIn('https://www.amazon.com/s?k=TN660+toner+cartridge', brother['url'])
+        self.assertIn('s=price-asc-rank', brother['url'])
+        ink=supplies.replacement_for('HP OfficeJet Pro 9020')
+        self.assertEqual(ink['kind'],'Ink')
+        self.assertEqual(ink['name'],'')
+        self.assertIn('OfficeJet+Pro+9020+ink+cartridge', ink['url'])
+        self.assertIsNone(supplies.replacement_for('  '))
+        with store.connection() as db:
+            db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol,identity) VALUES('TonerQ','Office Printer','192.0.2.41','socket','Brother HL-L2380DW series')")
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with patch.object(printing,'printer_reachable',return_value=False):
+            with TestClient(app) as client:
+                client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+                page=client.get('/?page=printers')
+        self.assertIn('Toner TN660', page.text)
+        self.assertIn('Lowest price on Amazon', page.text)
+        self.assertIn('TN660+toner+cartridge', page.text)
+        self.assertIn('rel="noopener noreferrer"', page.text)
+
+    def test_overview_shows_toner_level(self):
+        with store.connection() as db:
+            db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol,identity) VALUES('DashQ','Office Printer','192.0.2.43','socket','Brother HL-L2380DW series')")
+        sample={
+            'state':'Idle','reasons':['Toner low'],'pages':8421,'pages_label':'8,421',
+            'supplies':[{'name':'Black Toner','percent':18},{'name':'Drum','percent':4}],
+            'serial':'','firmware':'',
+        }
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=sample):
+            with TestClient(app) as client:
+                client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+                page=client.get('/')
+        self.assertIn('Black Toner', page.text)
+        self.assertIn('18%', page.text)
+        self.assertIn('role="meter"', page.text)
+        self.assertIn('aria-valuenow="18"', page.text)
+        self.assertIn('width: 18%', page.text)
+        self.assertIn('is-mid', page.text)
+        self.assertIn('is-low', page.text)
+        self.assertIn('8,421', page.text)
+        self.assertIn('Toner low', page.text)
+        self.assertIn('>Idle<', page.text)
+        self.assertIn('TN660', page.text)
+        self.assertIn('Toner, ink, and page count, read when this page opens.', page.text)
+
+    def test_printer_page_shows_live_readings(self):
+        with store.connection() as db:
+            db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol) VALUES('StatsQ','Office Printer','192.0.2.40','socket')")
+        sample={
+            'state':'Stopped','reasons':['Paper jam'],'pages':1200,'pages_label':'1,200',
+            'supplies':[{'name':'Black Toner','percent':36}],'serial':'E12345','firmware':'1.23',
+        }
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'printer_stats',return_value=sample):
+            with TestClient(app) as client:
+                client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+                page=client.get('/?page=printers')
+        self.assertIn('Paper jam', page.text)
+        self.assertIn('Black Toner', page.text)
+        self.assertIn('36%', page.text)
+        self.assertIn('1,200', page.text)
+        self.assertIn('E12345', page.text)
+        self.assertIn('1.23', page.text)
+        self.assertIn('>Stopped<', page.text)
+        self.assertIn('Status, toner, and page count are read when this page opens.', page.text)
 
     def test_saved_printer_is_reread_and_matched(self):
         calls=[]

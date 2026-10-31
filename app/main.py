@@ -10,7 +10,7 @@ from fastapi.responses import HTMLResponse, RedirectResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
 from starlette.middleware.sessions import SessionMiddleware
-from . import mailer, printing, store, tailnet
+from . import mailer, printing, store, supplies, tailnet
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -100,7 +100,8 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
     if page in ('overview', 'printers'):
         for printer in printers:
             printer['online'] = printing.printer_reachable(printer['host'], printer['protocol'])
-            printer['pages_total'] = printing.printer_snmp(printer['host']) if page == 'printers' and printer['online'] else None
+            printer['stats'] = printing.printer_stats(printer['host']) if printer['online'] else None
+            printer['supply'] = supplies.replacement_for(printer.get('identity') or printer.get('label') or '')
     jobs = store.records('jobs', 100) if page in ('overview', 'jobs') else []
     counts = {
         'total': len(jobs),

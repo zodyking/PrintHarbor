@@ -151,7 +151,11 @@ def parse_ipp(payload):
             if text_at + 2 <= len(value):
                 text_len = int.from_bytes(value[text_at:text_at + 2], 'big')
                 value = value[text_at + 2:text_at + 2 + text_len]
-        if tag in (0x36, 0x37, 0x41, 0x42, 0x44, 0x45, 0x47, 0x48, 0x49):
+        if tag in (0x21, 0x23) and len(value) == 4:
+            found.setdefault(current, []).append(int.from_bytes(value, 'big', signed=True))
+        elif tag == 0x22 and len(value) == 1:
+            found.setdefault(current, []).append(value[0] == 1)
+        elif tag in (0x36, 0x37, 0x41, 0x42, 0x44, 0x45, 0x47, 0x48, 0x49):
             found.setdefault(current, []).append(value.decode('utf-8', 'replace'))
     return found
 
@@ -159,12 +163,22 @@ def _ipp_attr(tag, name, value):
     encoded = value.encode('utf-8')
     return bytes([tag]) + len(name).to_bytes(2, 'big') + name.encode('ascii') + len(encoded).to_bytes(2, 'big') + encoded
 
-def _ipp_request(host):
+IPP_FIELDS = (
+    'printer-make-and-model', 'printer-device-id', 'printer-state', 'printer-state-reasons',
+    'printer-is-accepting-jobs', 'marker-names', 'marker-levels', 'marker-high-levels',
+    'printer-firmware-string', 'printer-firmware-name', 'printer-firmware-version',
+)
+
+def _ipp_request(host, detailed=False):
     uri = f'ipp://{host}/ipp/print'
     body = b'\x02\x00' + (0x000B).to_bytes(2, 'big') + (1).to_bytes(4, 'big') + b'\x01'
     body += _ipp_attr(0x47, 'attributes-charset', 'utf-8')
     body += _ipp_attr(0x48, 'attributes-natural-language', 'en')
     body += _ipp_attr(0x45, 'printer-uri', uri)
+    if detailed and IPP_FIELDS:
+        body += _ipp_attr(0x44, 'requested-attributes', IPP_FIELDS[0])
+        for name in IPP_FIELDS[1:]:
+            body += _ipp_attr(0x44, '', name)
     body += b'\x03'
     return body
 
@@ -179,23 +193,34 @@ def _read_socket(sock, limit=200000):
         total += len(piece)
     return b''.join(chunks)
 
-def ipp_identity(host):
-    body = _ipp_request(host)
-    http = (
-        f'POST /ipp/print HTTP/1.1\r\nHost: {host}:631\r\n'
-        f'Content-Type: application/ipp\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n'
-    ).encode('ascii') + body
-    for payload in (http, body):
-        try:
-            with socket.create_connection((host, 631), timeout=3) as sock:
-                sock.settimeout(3)
-                sock.sendall(payload)
-                parsed = parse_ipp(_read_socket(sock))
-        except OSError:
-            continue
-        if parsed.get('printer-make-and-model') or parsed.get('printer-device-id'):
-            return parsed
+def ipp_attributes(host):
+    """Read the printer's own description. A detailed ask falls back to the plain one."""
+    for detailed in (True, False):
+        body = _ipp_request(host, detailed=detailed)
+        http = (
+            f'POST /ipp/print HTTP/1.1\r\nHost: {host}:631\r\n'
+            f'Content-Type: application/ipp\r\nContent-Length: {len(body)}\r\nConnection: close\r\n\r\n'
+        ).encode('ascii') + body
+        gave_up = False
+        for payload in (http, body):
+            if gave_up:
+                break
+            try:
+                with socket.create_connection((host, 631), timeout=2) as sock:
+                    sock.settimeout(2)
+                    sock.sendall(payload)
+                    parsed = parse_ipp(_read_socket(sock))
+            except TimeoutError:
+                gave_up = True
+                continue
+            except OSError:
+                continue
+            if parsed.get('printer-make-and-model') or parsed.get('printer-device-id') or parsed.get('printer-state'):
+                return parsed
     return {}
+
+def ipp_identity(host):
+    return ipp_attributes(host)
 
 def pjl_identity(host):
     query = b'\x1b%-12345X@PJL INFO ID\r\n\x1b%-12345X'
@@ -769,14 +794,161 @@ def cancel_pending(job_id):
     if not updated:
         raise PrintError('A document already sent to the printer cannot be cancelled')
 
-def printer_snmp(host):
+IPP_STATES = {3: 'Idle', 4: 'Printing', 5: 'Stopped'}
+SNMP_STATES = {3: 'Idle', 4: 'Printing', 5: 'Warming up'}
+REASON_LABELS = (
+    ('media-jam', 'Paper jam'),
+    ('media-empty', 'Out of paper'),
+    ('media-needed', 'Paper needed'),
+    ('media-low', 'Paper low'),
+    ('toner-empty', 'Toner empty'),
+    ('toner-low', 'Toner low'),
+    ('marker-supply-empty', 'Toner empty'),
+    ('marker-supply-low', 'Toner low'),
+    ('door-open', 'A door is open'),
+    ('cover-open', 'A cover is open'),
+    ('input-tray-missing', 'A tray is missing'),
+    ('output-area-full', 'The output tray is full'),
+    ('output-area-almost-full', 'The output tray is almost full'),
+    ('paused', 'Paused'),
+)
+SNMP_OIDS = (
+    '1.3.6.1.2.1.43.10.2.1.4.1.1',
+    '1.3.6.1.2.1.43.5.1.1.17.1',
+    '1.3.6.1.2.1.25.3.5.1.1.1',
+) + tuple(
+    f'1.3.6.1.2.1.43.11.1.1.{field}.1.{index}'
+    for index in (1, 2, 3)
+    for field in ('6', '8', '9')
+)
+
+def supply_percent(level, high):
+    if not isinstance(level, int) or level < 0:
+        return None
+    if isinstance(high, int) and high > 0:
+        return max(0, min(100, round(level * 100 / high)))
+    if 0 <= level <= 100:
+        return level
+    return None
+
+def _reason_label(keyword):
+    key = str(keyword or '').split(',')[0].strip().lower()
+    if not key or key == 'none':
+        return ''
+    for needle, label in REASON_LABELS:
+        if needle in key:
+            return label
+    return ''
+
+def readings_from_ipp(attrs):
+    attrs = attrs or {}
+    state_values = attrs.get('printer-state') or []
+    state = IPP_STATES.get(state_values[0]) if state_values and isinstance(state_values[0], int) else ''
+    reasons = []
+    for keyword in attrs.get('printer-state-reasons') or []:
+        label = _reason_label(keyword)
+        if label and label not in reasons:
+            reasons.append(label)
+    accepting = attrs.get('printer-is-accepting-jobs') or []
+    if accepting and accepting[0] is False and 'Not accepting jobs' not in reasons:
+        reasons.append('Not accepting jobs')
+    names = list(attrs.get('marker-names') or [])
+    levels = list(attrs.get('marker-levels') or [])
+    highs = list(attrs.get('marker-high-levels') or [])
+    supplies = []
+    for index, level in enumerate(levels):
+        percent = supply_percent(level, highs[index] if index < len(highs) else 100)
+        if percent is None:
+            continue
+        name = str(names[index]).strip() if index < len(names) and str(names[index]).strip() else 'Toner'
+        supplies.append({'name': name[:40], 'percent': percent})
+    fields = device_fields((attrs.get('printer-device-id') or [''])[0])
+    serial = fields.get('SN') or fields.get('SERN') or ''
+    firmware = ''
+    for key in ('printer-firmware-string', 'printer-firmware-version', 'printer-firmware-name'):
+        values = attrs.get(key) or []
+        if values and str(values[0]).strip():
+            firmware = str(values[0]).strip()[:80]
+            break
+    return {
+        'state': state,
+        'reasons': reasons[:4],
+        'pages': None,
+        'supplies': supplies[:3],
+        'serial': str(serial).strip()[:40],
+        'firmware': firmware,
+    }
+
+def _snmp_text(raw):
+    text = str(raw or '').strip().strip('"')
+    low = text.lower()
+    if not text or 'no such' in low or 'nosuch' in low or low in ('null', 'nosuchobject', 'nosuchinstance'):
+        return ''
+    if re.fullmatch(r'(?:[0-9A-Fa-f]{2} )+[0-9A-Fa-f]{2}', text):
+        try:
+            text = bytes.fromhex(text).decode('utf-8', 'replace').strip()
+        except ValueError:
+            return ''
+    return text
+
+def _snmp_int(raw):
+    text = _snmp_text(raw).split()[0] if _snmp_text(raw) else ''
+    if text.lstrip('-').isdigit():
+        return int(text)
+    return None
+
+def _snmp_lines(host):
     community = os.getenv('SNMP_COMMUNITY', 'public')
-    # Printer MIB total pages vary by model. This is a best-effort counter, not toner level.
-    oid = '1.3.6.1.2.1.43.10.2.1.4.1.1'
     if not community or not shutil.which('snmpget'):
         return None
-    result = cmd('snmpget', '-v2c', '-c', community, '-t', '1', '-r', '0', '-Oqv', host, oid, timeout=4)
-    if result.returncode:
+    result = cmd('snmpget', '-v2c', '-c', community, '-t', '1', '-r', '0', '-Oqv', host, *SNMP_OIDS, timeout=4)
+    lines = (result.stdout or '').splitlines()
+    if len(lines) < len(SNMP_OIDS):
         return None
-    raw = (result.stdout or '').strip().strip('"')
-    return raw if raw.isdigit() else None
+    return [line.strip() for line in lines[:len(SNMP_OIDS)]]
+
+def readings_from_snmp(lines):
+    blank = {'state': '', 'reasons': [], 'pages': None, 'supplies': [], 'serial': '', 'firmware': ''}
+    if not lines or len(lines) < len(SNMP_OIDS):
+        return blank
+    pages = _snmp_int(lines[0])
+    if pages is not None and pages < 0:
+        pages = None
+    serial = _snmp_text(lines[1])[:40]
+    state = SNMP_STATES.get(_snmp_int(lines[2]) or 0, '')
+    supplies = []
+    for offset in range(3, len(SNMP_OIDS), 3):
+        name = _snmp_text(lines[offset]) or 'Toner'
+        percent = supply_percent(_snmp_int(lines[offset + 2]), _snmp_int(lines[offset + 1]))
+        if percent is None:
+            continue
+        supplies.append({'name': name[:40], 'percent': percent})
+    return {'state': state, 'reasons': [], 'pages': pages, 'supplies': supplies[:3], 'serial': serial, 'firmware': ''}
+
+def printer_stats(host):
+    """Live snapshot. Empty when the printer does not answer IPP or SNMP."""
+    try:
+        ipp = readings_from_ipp(ipp_attributes(host))
+        snmp = readings_from_snmp(_snmp_lines(host))
+    except Exception:
+        return None
+    supplies = ipp['supplies'] or snmp['supplies']
+    stats = {
+        'state': ipp['state'] or snmp['state'],
+        'reasons': ipp['reasons'],
+        'pages': snmp['pages'],
+        'pages_label': f"{snmp['pages']:,}" if isinstance(snmp['pages'], int) else '',
+        'supplies': supplies,
+        'serial': ipp['serial'] or snmp['serial'],
+        'firmware': ipp['firmware'],
+    }
+    if not any((stats['state'], stats['pages_label'], stats['supplies'], stats['serial'], stats['firmware'], stats['reasons'])):
+        return None
+    return stats
+
+def printer_snmp(host):
+    lines = _snmp_lines(host)
+    if not lines:
+        return None
+    pages = readings_from_snmp(lines)['pages']
+    return str(pages) if isinstance(pages, int) else None
