@@ -69,7 +69,7 @@ class CoreTests(unittest.TestCase):
         cfg={'allowed_senders':'trusted@example.com','mail_recipient':'print@example.com',
              'email_pin':'abcdef12','default_sides':'one-sided','max_files':'5',
              'default_queue':'Dads_Brother'}
-        with patch.object(printing,'cmd',return_value=SimpleNamespace(returncode=0,stdout='request id is Dads_Brother-34 (1 file(s))',stderr='')) as fake:
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'cmd',return_value=SimpleNamespace(returncode=0,stdout='request id is Dads_Brother-34 (1 file(s))',stderr='')) as fake:
             out=mailer.handle_message(msg,'test-mail-uid-1',cfg)
             self.assertEqual(out['jobs'],1)
             self.assertIn('sides=two-sided-long-edge',fake.call_args.args)
@@ -128,7 +128,7 @@ class CoreTests(unittest.TestCase):
             seen.append((Path(path).name, len(PdfReader(path).pages)))
             return SimpleNamespace(returncode=0, stdout='request id is Office-9 (1 file(s))', stderr='')
 
-        with patch.object(printing, 'cmd', side_effect=fake_cmd):
+        with patch.object(printing, 'printer_reachable', return_value=True), patch.object(printing, 'cmd', side_effect=fake_cmd):
             out=mailer.handle_message(msg, 'two-files-1', cfg)
         self.assertEqual(out['jobs'], 2)
         self.assertEqual(len(seen), 2)
@@ -169,7 +169,7 @@ class CoreTests(unittest.TestCase):
             self.assertIn('Please print this', page.text)
             self.assertIn('Sender is not allowlisted', page.text)
             self.assertIn('Email contained no supported attachments', page.text)
-            self.assertIn('>rejected<', page.text)
+            self.assertIn('>Rejected<', page.text)
             self.assertIn('Rejected mail stays in this log', page.text)
 
     def test_queue_input_validation(self):
@@ -436,6 +436,98 @@ class CoreTests(unittest.TestCase):
             row=db.execute('SELECT status, error FROM jobs WHERE id=?',(job_id,)).fetchone()
         self.assertEqual(row['status'],'error')
         self.assertIn('Interrupted',row['error'])
+
+    def _one_page_pdf(self, text):
+        from reportlab.pdfgen import canvas
+        import io
+        buf=io.BytesIO()
+        doc=canvas.Canvas(buf)
+        doc.drawString(50,700,text)
+        doc.showPage()
+        doc.save()
+        return buf.getvalue()
+
+    def _park_pending(self):
+        with store.connection() as db:
+            db.execute("UPDATE jobs SET status='cancelled' WHERE status='pending'")
+
+    def test_offline_printer_keeps_each_document_pending(self):
+        self._park_pending()
+        with store.connection() as db:
+            db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol) VALUES('WaitQ','Hold','192.0.2.8','socket')")
+        with patch.object(printing,'printer_reachable',return_value=False), patch.object(printing,'cmd') as fake:
+            first=printing.submit_file('first.pdf', self._one_page_pdf('one'), 'WaitQ')
+            second=printing.submit_file('second.pdf', self._one_page_pdf('two'), 'WaitQ')
+            fake.assert_not_called()
+        with store.connection() as db:
+            rows=db.execute("SELECT id,status,cups_id FROM jobs WHERE id IN (?,?) ORDER BY id",(first,second)).fetchall()
+        self.assertEqual([row['status'] for row in rows], ['pending','pending'])
+        self.assertEqual([row['cups_id'] for row in rows], ['',''])
+
+    def test_queue_sends_in_order_after_the_printer_answers(self):
+        self._park_pending()
+        with store.connection() as db:
+            db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol) VALUES('OrderQ','Hold','192.0.2.9','socket')")
+        sent=[]
+        def fake_cmd(*args, **kwargs):
+            self.assertEqual(args[0], 'lp')
+            sent.append(args[2])
+            return SimpleNamespace(returncode=0, stdout=f'request id is OrderQ-{len(sent)} (1 file(s))', stderr='')
+        with patch.object(printing,'printer_reachable',return_value=False):
+            first=printing.submit_file('order-one.pdf', self._one_page_pdf('one'), 'OrderQ', dedupe='order-first')
+            second=printing.submit_file('order-two.pdf', self._one_page_pdf('two'), 'OrderQ', dedupe='order-second')
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'cmd',side_effect=fake_cmd):
+            printing.release_queues()
+        self.assertEqual(sent, ['OrderQ','OrderQ'])
+        with store.connection() as db:
+            rows=db.execute("SELECT status,cups_id FROM jobs WHERE id IN (?,?) ORDER BY id",(first,second)).fetchall()
+        self.assertEqual([row['status'] for row in rows], ['submitted','submitted'])
+        self.assertEqual([row['cups_id'] for row in rows], ['OrderQ-1','OrderQ-2'])
+
+    def test_queue_stops_when_the_next_document_finds_the_printer_offline(self):
+        self._park_pending()
+        with store.connection() as db:
+            db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol) VALUES('StopQ','Hold','192.0.2.10','socket')")
+        answers=iter([True, False])
+        with patch.object(printing,'printer_reachable',return_value=False):
+            first=printing.submit_file('alive.pdf', self._one_page_pdf('one'), 'StopQ', dedupe='stop-alive')
+            second=printing.submit_file('later.pdf', self._one_page_pdf('two'), 'StopQ', dedupe='stop-later')
+        with patch.object(printing,'printer_reachable',side_effect=lambda *a, **k: next(answers)), patch.object(printing,'cmd',return_value=SimpleNamespace(returncode=0,stdout='request id is StopQ-7 (1 file(s))',stderr='')) as fake:
+            printing.release_queues()
+            self.assertEqual(fake.call_count, 1)
+        with store.connection() as db:
+            rows={row['id']: row['status'] for row in db.execute("SELECT id,status FROM jobs WHERE id IN (?,?)",(first,second))}
+        self.assertEqual(rows[first], 'submitted')
+        self.assertEqual(rows[second], 'pending')
+
+    def test_sent_document_cannot_be_cancelled(self):
+        self._park_pending()
+        with store.connection() as db:
+            db.execute("INSERT INTO jobs(source,filename,queue,status,cups_id) VALUES('upload','gone.pdf','OrderQ','submitted','OrderQ-9')")
+            sent=db.execute("SELECT id FROM jobs WHERE filename='gone.pdf' AND cups_id='OrderQ-9'").fetchone()['id']
+            db.execute("INSERT INTO jobs(source,filename,queue,status) VALUES('upload','waiting.pdf','OrderQ','pending')")
+            waiting=db.execute("SELECT id FROM jobs WHERE filename='waiting.pdf' AND status='pending'").fetchone()['id']
+        with self.assertRaises(printing.PrintError):
+            printing.cancel_pending(sent)
+        from fastapi.testclient import TestClient
+        from app.main import app
+        with patch.object(printing,'printer_reachable',return_value=False):
+            with TestClient(app) as client:
+                client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
+                page=client.get('/?page=jobs')
+                self.assertIn('Already sent', page.text)
+                self.assertIn('Cancel waiting.pdf', page.text)
+                self.assertNotIn('name="cups_id"', page.text)
+                self.assertIn('>Pending<', page.text)
+                self.assertIn('>Sent<', page.text)
+                token=re.search(r'name="token" value="([^"]+)"', page.text).group(1)
+                denied=client.post('/jobs/cancel',data={'token':token,'job_id':str(sent)},follow_redirects=False)
+                self.assertIn('cannot+be+cancelled', denied.headers['location'])
+                removed=client.post('/jobs/cancel',data={'token':token,'job_id':str(waiting)},follow_redirects=False)
+                self.assertIn('Removed+from+the+queue', removed.headers['location'])
+        with store.connection() as db:
+            self.assertEqual(db.execute('SELECT status FROM jobs WHERE id=?',(sent,)).fetchone()['status'], 'submitted')
+            self.assertEqual(db.execute('SELECT status FROM jobs WHERE id=?',(waiting,)).fetchone()['status'], 'cancelled')
 
     def test_safe_filename(self):
         self.assertEqual(printing._safe_filename('../../etc/passwd.pdf'),'passwd.pdf')

@@ -1,5 +1,7 @@
 {% set labels = {'overview':'Overview','printers':'Printers','jobs':'Print jobs','email':'Email automation','tailscale':'Tailscale'} %}
 {% set side_labels = {'one-sided':'Single-sided','two-sided-long-edge':'Long-edge duplex','two-sided-short-edge':'Short-edge duplex'} %}
+{% set job_labels = {'pending':'Pending','sending':'Sending','submitted':'Sent','error':'Failed','rejected':'Rejected','cancelled':'Cancelled','preparing':'Preparing'} %}
+{% set job_class = {'pending':'wait','sending':'wait','submitted':'online','error':'offline','rejected':'warn','cancelled':'neutral','preparing':'neutral'} %}
 {% set tone = 'good' if mail.state=='Healthy' or mail.state=='Watching' else ('bad' if mail.state=='Error' else 'warn') %}
 <!doctype html>
 <html lang="en">
@@ -7,7 +9,7 @@
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
-  <link rel="stylesheet" href="/static/style.css?v=3">
+  <link rel="stylesheet" href="/static/style.css?v=5">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
@@ -38,7 +40,7 @@
       <div class="headerline"><div><h1>Overview</h1><p class="muted">Printers, jobs, and intake status.</p></div><a class="button subtle" href="/?page=email">Email automation <span aria-hidden="true">→</span></a></div>
       <div class="metrics">
         <div class="metric"><span>Registered printers</span><strong>{{ counts.printers }}</strong><small>Configured CUPS destinations</small></div>
-        <div class="metric"><span>Submitted jobs</span><strong>{{ counts.submitted }}</strong><small>Status submitted in the latest 100</small></div>
+        <div class="metric"><span>Sent jobs</span><strong>{{ counts.submitted }}</strong><small>{% if counts.pending %}{{ counts.pending }} waiting for a printer{% else %}Sent in the latest 100{% endif %}</small></div>
         <div class="metric"><span>Attention needed</span><strong>{{ counts.errors }}</strong><small>Failed or rejected in the latest 100</small></div>
         <div class="metric"><span>Email automation</span><strong class="metric-word">{{ mail.state }}</strong><small>{% if mail.detail and mail.state != 'Healthy' %}{{ mail.detail }}{% else %}{{ mail.checked or 'Not checked yet' }}{% endif %}</small></div>
       </div>
@@ -54,7 +56,7 @@
               <label>Layout<select name="sides"><option value="one-sided">Single-sided</option><option value="two-sided-long-edge">Two-sided, long edge</option><option value="two-sided-short-edge">Two-sided, short edge</option></select></label>
               <label>Copies<input name="copies" type="number" min="1" max="10" value="1" inputmode="numeric"></label>
             </div>
-            <button class="button" type="submit">Send to printer <span aria-hidden="true">→</span></button>
+            <button class="button" type="submit">Add to queue <span aria-hidden="true">→</span></button>
           </form>
           {% else %}
           <div class="empty">No printers configured. <a href="/?page=printers">Add a printer.</a></div>
@@ -75,11 +77,11 @@
         </section>
       </div>
       <section class="panel" aria-labelledby="recent-jobs-title">
-        <div class="panelhead"><div><h2 id="recent-jobs-title">Recent jobs</h2><p>Submitted means CUPS accepted the job, not that a page printed.</p></div><a class="textlink" href="/?page=jobs">All jobs</a></div>
+        <div class="panelhead"><div><h2 id="recent-jobs-title">Recent jobs</h2><p>Pending waits for the printer. Sent is already at the printer and cannot be cancelled.</p></div><a class="textlink" href="/?page=jobs">All jobs</a></div>
         {% if jobs %}
         <div class="table-scroll"><table aria-labelledby="recent-jobs-title"><thead><tr><th scope="col">Document</th><th scope="col">Source</th><th scope="col">Printer</th><th scope="col">Pages</th><th scope="col">Status</th></tr></thead><tbody>
           {% for j in jobs[:7] %}
-          <tr><td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC</small>{% if j.error %}<small class="error-txt">{{ j.error }}</small>{% endif %}</td><td>{{ j.source|title }}</td><td>{{ j.queue }}</td><td>{{ j.pages or '—' }}</td><td><span class="status {% if j.status=='error' %}offline{% elif j.status=='rejected' %}warn{% elif j.status=='submitted' %}online{% else %}neutral{% endif %}">{{ j.status }}</span></td></tr>
+          <tr><td><strong>{{ j.filename }}</strong><small>{{ j.created_at }} UTC</small>{% if j.error %}<small class="error-txt">{{ j.error }}</small>{% endif %}</td><td>{{ j.source|title }}</td><td>{{ j.queue }}</td><td>{{ j.pages or '—' }}</td><td><span class="status {{ job_class.get(j.status, 'neutral') }}">{{ job_labels.get(j.status, j.status) }}</span></td></tr>
           {% endfor %}
         </tbody></table></div>
         {% else %}
@@ -184,9 +186,9 @@
         </div>
       </section>
     {% elif page=='jobs' %}
-      <div class="headerline"><div><h1>Print jobs</h1><p class="muted">Every received print is listed. Submitted means CUPS accepted the job, not that a page printed.</p></div></div>
+      <div class="headerline"><div><h1>Print jobs</h1><p class="muted">Received documents wait in the printer queue. Each one is sent only after a quick check that the printer is online.</p></div></div>
       <section class="panel" aria-labelledby="job-log-title">
-        <div class="panelhead"><div><h2 id="job-log-title">Job log</h2><p>Rejected mail stays in this log with the reason. Failed jobs can be retried when the converted file is still stored.</p></div><span class="chip">{{ jobs|length }} recent jobs</span></div>
+        <div class="panelhead"><div><h2 id="job-log-title">Job log</h2><p>Rejected mail stays in this log with the reason. Pending documents print in order when the printer is back online. A document already sent cannot be cancelled.</p></div><span class="chip">{{ jobs|length }} recent jobs</span></div>
         {% if jobs %}
         <div class="table-scroll"><table aria-labelledby="job-log-title"><thead><tr><th scope="col">Document</th><th scope="col">Sender</th><th scope="col">Target</th><th scope="col">Pages</th><th scope="col">Status</th><th scope="col">Actions</th></tr></thead><tbody>
           {% for j in jobs %}
@@ -195,14 +197,14 @@
             <td>{{ j.sender or j.source|title }}</td>
             <td>{{ j.queue }}{% if j.cups_id %}<small>{{ j.cups_id }}</small>{% endif %}</td>
             <td>{{ j.pages or '—' }} × {{ j.copies }}</td>
-            <td><span class="status {% if j.status=='error' %}offline{% elif j.status=='rejected' %}warn{% elif j.status=='submitted' %}online{% else %}neutral{% endif %}">{{ j.status }}</span></td>
+            <td><span class="status {{ job_class.get(j.status, 'neutral') }}">{{ job_labels.get(j.status, j.status) }}</span></td>
             <td>
               {% if j.status=='error' %}
               <form action="/jobs/retry" method="post"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="job_id" value="{{ j.id }}"><button class="textlink" type="submit" aria-label="Retry {{ j.filename }}">Retry</button></form>
-              {% elif j.cups_id and j.status=='submitted' %}
-              <form action="/jobs/cancel" method="post"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="cups_id" value="{{ j.cups_id }}"><button class="textlink" type="submit" aria-label="Cancel {{ j.cups_id }}">Cancel</button></form>
+              {% elif j.status=='pending' and not j.cups_id %}
+              <form action="/jobs/cancel" method="post"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="job_id" value="{{ j.id }}"><button class="textlink" type="submit" aria-label="Cancel {{ j.filename }}">Cancel</button></form>
               {% elif j.status=='submitted' %}
-              <small>No CUPS id</small>
+              <small>Already sent</small>
               {% endif %}
             </td>
           </tr>
@@ -213,7 +215,7 @@
         {% endif %}
       </section>
       <section class="panel" aria-labelledby="cups-queue-title">
-        <div class="panelhead"><div><h2 id="cups-queue-title">Current CUPS queue</h2><p>Jobs CUPS still has active. This is separate from the log above.</p></div></div>
+        <div class="panelhead"><div><h2 id="cups-queue-title">Current CUPS queue</h2><p>Documents already handed to the printer. These cannot be cancelled.</p></div></div>
         {% if not active_jobs.ok %}
         <div class="alert bad" role="alert">CUPS queue is unavailable. {{ active_jobs.error }}</div>
         {% elif active_jobs.lines %}
