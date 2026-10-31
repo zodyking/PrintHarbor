@@ -107,7 +107,7 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
     if page in ('overview', 'printers'):
         for printer in printers:
             printer['online'] = printing.printer_reachable(printer['host'], printer['protocol'])
-            printer['stats'] = printing.printer_stats(printer['host']) if printer['online'] else None
+            printer['stats'] = printing.printer_stats(printer['host'], printer.get('identity') or printer.get('label') or '') if printer['online'] else None
             printer['condition'] = printing.condition(printer['stats'], printer['online'])
             printer['supply'] = supplies.replacement_for(printer.get('identity') or printer.get('label') or '')
             printer['image'] = images.describe(printer)

@@ -17,7 +17,7 @@ from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen.canvas import Canvas
-from . import store
+from . import brother, store
 
 Image.MAX_IMAGE_PIXELS = 40_000_000
 
@@ -732,8 +732,73 @@ def supply_problem(stats):
     }
 
 
-def supply_hold(queue):
-    """Read the printer. None when it did not report a supply fault."""
+def _check_bad(stats, label):
+    for row in (stats or {}).get('checks') or []:
+        if str(row.get('label') or '') == label and row.get('bad'):
+            return True
+    return False
+
+
+def _health_value(stats):
+    health = str((stats or {}).get('health') or '')
+    if health:
+        return health
+    for row in (stats or {}).get('checks') or []:
+        if str(row.get('label') or '') == 'Health':
+            return str(row.get('value') or '')
+    return ''
+
+
+def printer_issues(stats, online=True):
+    """Problems worth holding a job for. Unreported readings are left out."""
+    if not online:
+        return ['The printer is not connected.']
+    if not stats:
+        return []
+    issues = []
+    for item in stats.get('supplies') or []:
+        kind = _supply_kind(item.get('name') or '')
+        percent = item.get('percent')
+        if not kind or not isinstance(percent, int) or percent > LOW_SUPPLY:
+            continue
+        label = ' '.join(str(item.get('name') or kind).split())
+        issues.append(f'{label} is at {percent}%.')
+    reasons = [str(item) for item in (stats.get('reasons') or [])]
+    state = condition(stats, online=True)
+    if state['paper'] == 'empty' or _check_bad(stats, 'No paper'):
+        issues.append('The paper tray is empty.')
+    if state['jam'] == 'jam' or _check_bad(stats, 'Paper jam'):
+        issues.append('There is a paper jam.')
+    if _check_bad(stats, 'Door') or any(item in reasons for item in ('A door is open', 'A cover is open')):
+        issues.append('A door is open.' if 'A cover is open' not in reasons else 'A cover is open.')
+    health = _health_value(stats)
+    if health == 'Warning':
+        issues.append('Printer health is warning.')
+    elif health == 'Down':
+        issues.append('The printer is down.')
+    if _check_bad(stats, 'No toner') and not any('toner' in item.lower() for item in issues):
+        issues.append('The toner is empty.')
+    if _check_bad(stats, 'No ink') and not any('ink' in item.lower() for item in issues):
+        issues.append('The ink is empty.')
+    extras = (
+        ('A tray is missing', 'A paper tray is missing.'),
+        ('The output tray is full', 'The output tray is full.'),
+        ('Paused', 'The printer is paused.'),
+        ('Not accepting jobs', 'The printer is not accepting jobs.'),
+        ('Toner empty', 'The toner is empty.'),
+    )
+    for reason, sentence in extras:
+        if reason in reasons and sentence not in issues and not any(sentence.lower() in item.lower() for item in issues):
+            if reason == 'Toner empty' and any('toner' in item.lower() for item in issues):
+                continue
+            issues.append(sentence)
+    if not issues and str(stats.get('state') or '') == 'Stopped':
+        issues.append('The printer is stopped.')
+    return issues
+
+
+def printer_block(queue):
+    """None when the printer can take a job. Otherwise the reported problems."""
     if not QUEUE_RE.fullmatch(queue or ''):
         return None
     with store.connection() as db:
@@ -741,18 +806,59 @@ def supply_hold(queue):
             'SELECT host, protocol, label, identity FROM printers WHERE queue=?',
             (queue,),
         ).fetchone()
-    if not printer or not printer_reachable(printer['host'], printer['protocol'], timeout=1):
+    if not printer:
         return None
-    try:
-        stats = printer_stats(printer['host'])
-    except Exception:
+    label = (printer['label'] or queue)[:100]
+    identity = printer['identity'] or printer['label'] or ''
+    online = printer_reachable(printer['host'], printer['protocol'], timeout=1)
+    stats = None
+    if online:
+        try:
+            stats = printer_stats(printer['host'], identity)
+        except Exception:
+            stats = None
+    issues = printer_issues(stats, online=online)
+    if not issues:
         return None
-    problem = supply_problem(stats)
-    if not problem:
+    return {'issues': issues, 'label': label, 'identity': identity}
+
+
+def waiting_text(issues):
+    text = ' '.join(issues or [])
+    if text and not text.endswith('.'):
+        text += '.'
+    return ('Waiting: ' + text)[:500]
+
+
+def _mark_waiting(queue, issues):
+    message = waiting_text(issues)
+    with store.connection() as db:
+        db.execute(
+            "UPDATE jobs SET error=? WHERE queue=? AND status='pending'",
+            (message, queue),
+        )
+
+
+def supply_hold(queue):
+    """Read the printer. None when it did not report a supply fault."""
+    block = printer_block(queue)
+    if not block:
         return None
-    problem['label'] = (printer['label'] or queue)[:100]
-    problem['identity'] = printer['identity'] or printer['label'] or ''
-    return problem
+    narrowed = [item for item in block['issues'] if item != 'The printer is not connected.']
+    if not narrowed:
+        return None
+    reason = ' '.join(narrowed)
+    if not reason.endswith('.'):
+        reason += '.'
+    reason += ' The document was not printed.'
+    blocked = {'The paper tray is empty.', 'There is a paper jam.', 'A door is open.', 'A cover is open.', 'The printer is down.'}
+    return {
+        'reason': reason,
+        'problems': narrowed,
+        'notice': not any(item in blocked for item in narrowed),
+        'label': block['label'],
+        'identity': block['identity'],
+    }
 
 
 def _wrap_line(text, font, size, width):
@@ -878,7 +984,7 @@ def record_rejection(filename, reason, queue='', source='email', sender='', dedu
         )
         return cur.lastrowid
 
-def submit_file(filename, data, queue, copies=1, sides='one-sided', source='upload', sender='', dedupe=None):
+def submit_file(filename, data, queue, copies=1, sides='one-sided', source='upload', sender='', dedupe=None, release=True):
     cfg = store.settings()
     max_mb = max(1, min(int(cfg.get('max_mb', '12')), 30))
     safe_name = _safe_filename(filename)
@@ -897,14 +1003,6 @@ def submit_file(filename, data, queue, copies=1, sides='one-sided', source='uplo
     if not configured:
         record_rejection(safe_name, 'Printer not configured', queue, source, sender, dedupe, copies, sides)
         raise PrintError('Printer not configured')
-    hold = supply_hold(queue)
-    if hold:
-        record_rejection(safe_name, hold['reason'], queue, source, sender, dedupe, copies, sides)
-        try:
-            print_supply_notice(queue, hold)
-        except Exception:
-            store.event('warning', 'The supply notice could not be printed')
-        raise PrintError(hold['reason'])
     with store.connection() as db:
         if dedupe:
             existing = db.execute('SELECT id, status FROM jobs WHERE dedupe=?', (dedupe,)).fetchone()
@@ -925,7 +1023,8 @@ def submit_file(filename, data, queue, copies=1, sides='one-sided', source='uplo
                 "UPDATE jobs SET filepath=?,pages=?,status='pending',error='' WHERE id=?",
                 (path, pages, job_id),
             )
-        release_queues()
+        if release:
+            release_queues()
         return job_id
     except Exception as exc:
         with store.connection() as db:
@@ -991,7 +1090,9 @@ def _release_queue(queue):
                     ('Printer not configured', job['id']),
                 )
             continue
-        if not printer_reachable(printer['host'], printer['protocol'], timeout=1):
+        block = printer_block(queue)
+        if block:
+            _mark_waiting(queue, block['issues'])
             return
         try:
             dispatch(job['id'])
@@ -1056,6 +1157,11 @@ def dispatch(job_id):
     with store.connection() as db:
         db.execute('UPDATE jobs SET status=?,error=?,cups_id=? WHERE id=?', ('submitted', '', cups_id, job_id))
     store.event('success', f'Job {job_id} sent to {record["queue"]}: {record["filename"][:100]}')
+    try:
+        from . import mailer
+        mailer.note_dispatched(record)
+    except Exception:
+        store.event('warning', 'The sending confirmation could not be emailed')
     return job_id
 
 def cancel_pending(job_id):
@@ -1240,24 +1346,37 @@ def condition(stats, online=False):
         'note': notes[0] if notes else '',
     }
 
-def printer_stats(host):
+def printer_stats(host, identity=''):
     """Live snapshot. Empty when the printer does not answer IPP or SNMP."""
     try:
         ipp = readings_from_ipp(ipp_attributes(host))
         snmp = readings_from_snmp(_snmp_lines(host))
     except Exception:
         return None
-    supplies = ipp['supplies'] or snmp['supplies']
+    extra = None
+    if brother.looks_like_brother(identity):
+        try:
+            extra = brother.readings(host, identity)
+        except Exception:
+            extra = None
+    pages = snmp['pages']
+    if pages is None and extra and isinstance(extra.get('pages'), int):
+        pages = extra['pages']
+    reasons = list(ipp['reasons'])
+    for item in (extra or {}).get('reasons') or []:
+        if item not in reasons:
+            reasons.append(item)
     stats = {
-        'state': ipp['state'] or snmp['state'],
-        'reasons': ipp['reasons'],
-        'pages': snmp['pages'],
-        'pages_label': f"{snmp['pages']:,}" if isinstance(snmp['pages'], int) else '',
-        'supplies': supplies,
-        'serial': ipp['serial'] or snmp['serial'],
+        'state': ipp['state'] or snmp['state'] or ((extra or {}).get('state') or ''),
+        'reasons': reasons,
+        'pages': pages,
+        'pages_label': f'{pages:,}' if isinstance(pages, int) else '',
+        'supplies': ((extra or {}).get('supplies') or ipp['supplies'] or snmp['supplies']),
+        'serial': ipp['serial'] or snmp['serial'] or ((extra or {}).get('serial') or ''),
         'firmware': ipp['firmware'],
+        'checks': (extra or {}).get('checks') or [],
     }
-    if not any((stats['state'], stats['pages_label'], stats['supplies'], stats['serial'], stats['firmware'], stats['reasons'])):
+    if not any((stats['state'], stats['pages_label'], stats['supplies'], stats['serial'], stats['firmware'], stats['reasons'], stats['checks'])):
         return None
     return stats
 
