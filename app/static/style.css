@@ -48,7 +48,7 @@ a.tail-info:hover{background:rgba(255,255,255,.1)}
 .user-badge{font-weight:600;display:flex;align-items:center;gap:8px;min-width:0}
 .user-badge span:last-child{overflow:hidden;text-overflow:ellipsis;white-space:nowrap}
 .avatar{width:32px;height:32px;border-radius:50%;background:#eceef2;color:var(--ink);display:inline-grid;place-items:center;font-weight:600;font-size:13px;flex-shrink:0}
-.content{padding:32px 32px 48px;max-width:1120px}
+.content{width:100%;margin:0;padding:32px 32px 48px;text-align:left}
 .headerline{display:flex;justify-content:space-between;align-items:flex-end;gap:24px;margin-bottom:24px}
 .headerline p{margin-bottom:0;max-width:42rem}
 .metrics{display:grid;grid-template-columns:repeat(4,minmax(0,1fr));gap:16px;margin-bottom:24px}
@@ -94,6 +94,7 @@ a.tail-info:hover{background:rgba(255,255,255,.1)}
 .status.online{color:var(--green);background:#e8f6ee}
 .status.offline{color:var(--red);background:#fdecee}
 .status.neutral{color:#3e4650;background:#f1f2f4}
+.status.wait{color:#3e4650;background:#eef0f3}
 .status.warn{color:#6a4a12;background:#fff4e2}
 .footlink{margin-top:12px;color:var(--blue-ink);font-weight:600;font-size:14px;display:inline-flex;min-height:44px;align-items:center}
 .textlink{color:var(--blue-ink);background:none;border:0;padding:8px 0;min-height:44px;font-weight:600;font-size:14px;display:inline-flex;align-items:center}

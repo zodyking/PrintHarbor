@@ -6,6 +6,7 @@ import shutil
 import socket
 import subprocess
 import tempfile
+import threading
 import uuid
 from pathlib import Path
 from PIL import Image, UnidentifiedImageError
@@ -26,6 +27,10 @@ OPTION_VALUE_RE = re.compile(r'^[A-Za-z0-9_+-]{1,20}$')
 
 class PrintError(Exception):
     pass
+
+STOP = threading.Event()
+_QUEUE_LOCKS = {}
+_QUEUE_LOCKS_GUARD = threading.Lock()
 
 def cmd(*args, timeout=25):
     env = os.environ.copy()
@@ -50,10 +55,11 @@ def interpret_lpstat(result):
         return {'ok': True, 'lines': [], 'error': ''}
     return {'ok': False, 'lines': [], 'error': (err or (result.stdout or '').strip() or 'lpstat failed')[:200]}
 
-def printer_reachable(host, protocol):
+def printer_reachable(host, protocol, timeout=2):
+    """A real connect to the printer port. Short enough to run before each document."""
     port = 631 if protocol == 'ipp' else 9100
     try:
-        with socket.create_connection((host, port), timeout=2):
+        with socket.create_connection((host, port), timeout=timeout):
             return True
     except OSError:
         return False
@@ -600,7 +606,7 @@ def submit_file(filename, data, queue, copies=1, sides='one-sided', source='uplo
         if dedupe:
             existing = db.execute('SELECT id, status FROM jobs WHERE dedupe=?', (dedupe,)).fetchone()
             if existing:
-                if existing['status'] in ('submitted', 'cancelled'):
+                if existing['status'] in ('submitted', 'cancelled', 'pending', 'sending'):
                     return existing['id']
                 raise PrintError('This attachment was already processed; retry the failed job from Print jobs')
         cur = db.execute(
@@ -612,8 +618,12 @@ def submit_file(filename, data, queue, copies=1, sides='one-sided', source='uplo
     try:
         path, pages = prepare_bytes(safe_name, data, max(1, min(int(cfg.get('max_pages', '40')), 200)))
         with store.connection() as db:
-            db.execute('UPDATE jobs SET filepath=?,pages=? WHERE id=?', (path, pages, job_id))
-        return dispatch(job_id)
+            db.execute(
+                "UPDATE jobs SET filepath=?,pages=?,status='pending',error='' WHERE id=?",
+                (path, pages, job_id),
+            )
+        release_queues()
+        return job_id
     except Exception as exc:
         with store.connection() as db:
             db.execute('UPDATE jobs SET status=?,error=? WHERE id=?', ('error', str(exc)[:500], job_id))
@@ -640,17 +650,96 @@ def sheet_for_duplex(path, sides):
         writer.write(handle)
     return str(padded)
 
+def _queue_lock(queue):
+    with _QUEUE_LOCKS_GUARD:
+        lock = _QUEUE_LOCKS.get(queue)
+        if lock is None:
+            lock = threading.Lock()
+            _QUEUE_LOCKS[queue] = lock
+        return lock
+
+def release_queues():
+    """Send waiting documents, one printer at a time, and stop a queue when it is offline."""
+    with store.connection() as db:
+        rows = db.execute("SELECT DISTINCT queue FROM jobs WHERE status='pending' ORDER BY id").fetchall()
+    for row in rows:
+        lock = _queue_lock(row['queue'])
+        if not lock.acquire(blocking=False):
+            continue
+        try:
+            _release_queue(row['queue'])
+        finally:
+            lock.release()
+
+def _release_queue(queue):
+    while True:
+        with store.connection() as db:
+            printer = db.execute('SELECT host, protocol FROM printers WHERE queue=?', (queue,)).fetchone()
+            job = db.execute(
+                "SELECT id FROM jobs WHERE status='pending' AND queue=? ORDER BY id LIMIT 1",
+                (queue,),
+            ).fetchone()
+        if not job:
+            return
+        if not printer:
+            with store.connection() as db:
+                db.execute(
+                    "UPDATE jobs SET status='error', error=? WHERE id=? AND status='pending'",
+                    ('Printer not configured', job['id']),
+                )
+            continue
+        if not printer_reachable(printer['host'], printer['protocol']):
+            return
+        try:
+            dispatch(job['id'])
+        except PrintError:
+            continue
+
+def run_queue():
+    while not STOP.is_set():
+        try:
+            release_queues()
+        except Exception:
+            store.event('warning', 'The print queue could not be checked')
+        STOP.wait(3)
+
+def requeue(job_id):
+    with store.connection() as db:
+        row = db.execute('SELECT status, filepath FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not row or row['status'] != 'error':
+            raise PrintError('Only failed jobs can be retried')
+        if not row['filepath'] or not Path(row['filepath']).is_file():
+            raise PrintError('The saved document is not available for retry')
+        db.execute("UPDATE jobs SET status='pending', error='' WHERE id=? AND status='error'", (job_id,))
+    release_queues()
+    return job_id
+
 def dispatch(job_id):
     with store.connection() as db:
         record = db.execute('SELECT * FROM jobs WHERE id=?', (job_id,)).fetchone()
-    if not record:
-        raise PrintError('Job not found')
-    if not record['filepath'] or not Path(record['filepath']).is_file():
-        raise PrintError('The saved document is not available for retry')
-    print_path = sheet_for_duplex(record['filepath'], record['sides'])
-    command = ['lp', '-d', record['queue'], '-n', str(record['copies']), '-o', 'sides=' + record['sides'], print_path]
+        if not record:
+            raise PrintError('Job not found')
+        if not record['filepath'] or not Path(record['filepath']).is_file():
+            db.execute(
+                "UPDATE jobs SET status='error', error=? WHERE id=? AND status='pending'",
+                ('The saved document is not available for retry', job_id),
+            )
+            raise PrintError('The saved document is not available for retry')
+        claimed = db.execute(
+            "UPDATE jobs SET status='sending', error='' WHERE id=? AND status='pending'",
+            (job_id,),
+        ).rowcount
+    if not claimed:
+        return None
+    print_path = record['filepath']
     try:
+        print_path = sheet_for_duplex(record['filepath'], record['sides'])
+        command = ['lp', '-d', record['queue'], '-n', str(record['copies']), '-o', 'sides=' + record['sides'], print_path]
         result = cmd(*command, timeout=35)
+    except Exception as exc:
+        with store.connection() as db:
+            db.execute('UPDATE jobs SET status=?,error=? WHERE id=?', ('error', str(exc)[:400], job_id))
+        raise
     finally:
         if print_path != record['filepath']:
             Path(print_path).unlink(missing_ok=True)
@@ -663,17 +752,22 @@ def dispatch(job_id):
     cups_id = match.group(1) if match else ''
     with store.connection() as db:
         db.execute('UPDATE jobs SET status=?,error=?,cups_id=? WHERE id=?', ('submitted', '', cups_id, job_id))
-    store.event('success', f'Job {job_id} submitted to CUPS: {record["filename"][:100]}')
+    store.event('success', f'Job {job_id} sent to {record["queue"]}: {record["filename"][:100]}')
     return job_id
 
-def cancel_cups(cups_id):
-    if not re.fullmatch(r'[A-Za-z][A-Za-z0-9_-]{0,40}-\d{1,12}', cups_id):
-        raise PrintError('Invalid CUPS job ID')
-    result = cmd('cancel', cups_id)
-    if result.returncode:
-        raise PrintError(result.stderr or 'Cancel failed')
+def cancel_pending(job_id):
     with store.connection() as db:
-        db.execute("UPDATE jobs SET status='cancelled' WHERE cups_id=?", (cups_id,))
+        row = db.execute('SELECT status, cups_id FROM jobs WHERE id=?', (job_id,)).fetchone()
+        if not row:
+            raise PrintError('Job not found')
+        if row['status'] != 'pending' or row['cups_id']:
+            raise PrintError('A document already sent to the printer cannot be cancelled')
+        updated = db.execute(
+            "UPDATE jobs SET status='cancelled', error='' WHERE id=? AND status='pending' AND cups_id=''",
+            (job_id,),
+        ).rowcount
+    if not updated:
+        raise PrintError('A document already sent to the printer cannot be cancelled')
 
 def printer_snmp(host):
     community = os.getenv('SNMP_COMMUNITY', 'public')

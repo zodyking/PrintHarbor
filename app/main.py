@@ -20,11 +20,16 @@ async def lifespan(app: FastAPI):
     except Exception:
         store.event('warning', 'Saved printers could not be checked')
     mailer.STOP.clear()
+    printing.STOP.clear()
     thread = threading.Thread(target=mailer.run_loop, daemon=True, name='imap-poller')
+    queue_thread = threading.Thread(target=printing.run_queue, daemon=True, name='print-queue')
     thread.start()
+    queue_thread.start()
     yield
     mailer.STOP.set()
+    printing.STOP.set()
     thread.join(timeout=4)
+    queue_thread.join(timeout=2)
 
 secret = os.getenv('SESSION_SECRET', '')
 if len(secret) < 32 or secret.startswith('REPLACE_'):
@@ -101,6 +106,7 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
         'total': len(jobs),
         'errors': sum(j['status'] in ('error', 'rejected') for j in jobs),
         'submitted': sum(j['status'] == 'submitted' for j in jobs),
+        'pending': sum(j['status'] == 'pending' for j in jobs),
         'printers': len(printers),
     }
     return templates.TemplateResponse(request, 'dashboard.html', {
@@ -176,7 +182,7 @@ def upload(request: Request, token: str = Form(...), printer: str = Form(...), s
             printing.record_rejection(file.filename or 'document.pdf', f'File larger than {max_mb} MB limit', printer, 'upload', request.session.get('username') or '')
             return nextpage('overview', error=f'File larger than {max_mb} MB limit')
         printing.submit_file(file.filename or 'document.pdf', contents, printer, copies, sides)
-        return nextpage('jobs', 'Document submitted to CUPS')
+        return nextpage('jobs', 'Document added to the printer queue')
     except Exception as exc:
         return nextpage('overview', error=str(exc))
 
@@ -188,17 +194,17 @@ def retry(request: Request, token: str = Form(...), job_id: int = Form(...)):
             row = db.execute('SELECT status FROM jobs WHERE id=?', (job_id,)).fetchone()
         if not row or row['status'] != 'error':
             raise printing.PrintError('Only failed jobs can be retried')
-        printing.dispatch(job_id)
-        return nextpage('jobs', 'Job resubmitted to CUPS')
+        printing.requeue(job_id)
+        return nextpage('jobs', 'Job added back to the printer queue')
     except Exception as exc:
         return nextpage('jobs', error=str(exc))
 
 @app.post('/jobs/cancel')
-def cancel_job(request: Request, token: str = Form(...), cups_id: str = Form(...)):
+def cancel_job(request: Request, token: str = Form(...), job_id: int = Form(...)):
     csrf(request, token)
     try:
-        printing.cancel_cups(cups_id)
-        return nextpage('jobs', 'Cancellation requested')
+        printing.cancel_pending(job_id)
+        return nextpage('jobs', 'Removed from the queue')
     except Exception as exc:
         return nextpage('jobs', error=str(exc))
 

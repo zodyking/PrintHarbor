@@ -96,6 +96,10 @@ def initialize():
             "UPDATE jobs SET status='error', error=? WHERE status='preparing'",
             ('Interrupted before the document was submitted',),
         )
+        db.execute(
+            "UPDATE jobs SET status='error', error=? WHERE status='sending'",
+            ('Interrupted while sending to the printer',),
+        )
 
 def verify_user(username, password):
     with connection() as db:
