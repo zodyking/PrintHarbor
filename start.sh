@@ -1,6 +1,7 @@
 #!/bin/sh
 set -eu
-mkdir -p /data/files /data/tmp /run/cups /var/lib/tailscale /var/run/tailscale /etc/cups /var/spool/cups/tmp
+mkdir -p /data/files /data/tmp /data/tailscale /run/cups /etc/cups /var/spool/cups/tmp
+printf '%s\n' letter > /etc/papersize
 chmod 700 /data/files /data/tmp
 if [ ! -s /etc/cups/cupsd.conf ] && [ -f /usr/share/printharbor/cups-seed/cupsd.conf ]; then
   cp -a /usr/share/printharbor/cups-seed/. /etc/cups/
@@ -15,10 +16,6 @@ trap shutdown EXIT INT TERM
 # CUPS accepts local requests only. Its port is not published by Docker.
 cupsd -f &
 PIDS="$!"
-if command -v tailscaled >/dev/null 2>&1 && [ -c /dev/net/tun ]; then
-  tailscaled --state=/var/lib/tailscale/tailscaled.state --socket=/var/run/tailscale/tailscaled.sock &
-  PIDS="$PIDS $!"
-fi
 for i in 1 2 3 4 5 6 7 8 9 10; do
   if lpstat -r >/dev/null 2>&1; then break; fi
   sleep 1

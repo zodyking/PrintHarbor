@@ -144,6 +144,7 @@ a.tail-info:hover{background:rgba(255,255,255,.1)}
 .form-stack .dest-choice input,.candidate-list input[type=radio]{margin:0;width:18px;height:18px;min-height:18px;padding:0;flex:none;border-radius:50%;box-shadow:none}
 .dest-choice span{font-size:14px;font-weight:600}
 .image-change{margin-top:16px}
+.tail-device{display:flex;flex-direction:column;gap:16px;margin-top:12px}
 .image-change summary{cursor:pointer;font-weight:600;min-height:44px;display:flex;align-items:center}
 .candidate-list{border:0;margin:0;padding:0;display:grid;grid-template-columns:repeat(auto-fill,minmax(160px,1fr));gap:8px}
 .candidate-list legend{font-size:13px;font-weight:600;padding:0;margin-bottom:8px;grid-column:1/-1}
