@@ -20,7 +20,7 @@ Use PrintHarbor on a host that can reach your printer. That host can be on the s
 - Optional sender allowlist, optional subject PIN, and an optional check that To or Cc includes a chosen address. Leave a field blank to turn that check off
 - Subject commands for long-edge duplex (`DUPLEX` or `2-SIDED`), short-edge duplex (`SHORT EDGE`), and `COPIES=` from 1 to 10
 - Event log for rejections, CUPS results, and settings changes
-- Tailscale join from the dashboard, when the container can open `/dev/net/tun`
+- One Tailscale device per printer, joined from the dashboard. Each printer has its own hostname and address
 
 Submitted means CUPS accepted the job. A sheet leaving the printer is a separate outcome.
 
@@ -61,8 +61,7 @@ These are the dashboard on a fresh local session. No printer, mailbox, or tailne
 - An IMAP mailbox and an app password. Gmail uses `imap.gmail.com` port 993
 - `SESSION_SECRET`: a unique random value of at least 32 characters. Values shorter than that, and the placeholder in `.env.example`, are rejected
 - `ADMIN_PASSWORD`: set before first launch, at least 12 characters, and different from the placeholder. The account is created when it does not already exist
-- Optional Tailscale auth key (`TS_AUTHKEY`) when you use the included Compose file
-- Optional `snmpget` and `SNMP_COMMUNITY` for the lifetime page counter
+- Optional `snmpget` and `SNMP_COMMUNITY` for the lifetime page counter. SNMP stays on the local network; print and IPP traffic for a joined printer use that printer's Tailscale device
 
 The Docker image installs CUPS, LibreOffice, and the related tools. `start.sh` starts `cupsd`, then Uvicorn on port 47831 inside the container.
 
@@ -75,7 +74,7 @@ cp .env.example .env
 python3 -c 'import secrets; print(secrets.token_urlsafe(48))'
 ```
 
-Put that value in `SESSION_SECRET`. Set `ADMIN_PASSWORD` to your own password. Set `TS_AUTHKEY` as well when you use Docker Compose.
+Put that value in `SESSION_SECRET`. Set `ADMIN_PASSWORD` to your own password. A Tailscale auth key is entered per printer in the dashboard and is not stored in `.env`.
 
 Compose publishes the dashboard on the host loopback interface:
 
@@ -108,15 +107,15 @@ After the dashboard is up:
 
 Mailbox credentials are entered in the dashboard. They are stored encrypted with a key derived from `SESSION_SECRET`.
 
-The Compose Tailscale service accepts advertised routes. A device on the printer LAN still has to advertise that printer's address, preferably as a `/32`, and the route has to be approved in the tailnet policy. Enter that LAN address in Printers.
+Each printer joins as its own Tailscale device and accepts routes for itself. A device on the printer LAN still has to advertise that printer's address, preferably as a `/32`, and the route has to be approved for that printer's device. Enter that LAN address in Printers.
 
 ## Operational notes
 
-- Keep `.env` private. It holds the session secret, the initial admin password, and the Tailscale auth key.
+- Keep `.env` private. It holds the session secret and the initial admin password. Printer Tailscale state stays in the data directory.
 - Rotate the subject PIN from Email automation if it is exposed.
 - Uploaded documents remain in the data directory so failed jobs can be retried. This release has no automatic retention cleanup.
 - Email intake watches the selected folder for mail that arrives after watching starts. It does not copy the rest of the mailbox. Handled messages are marked seen, including rejected ones. It does not delete mail.
-- `docker-compose.yml` keeps named volumes for the dashboard data, CUPS queues, the print spool, and Tailscale state. Redeploy the same Compose app to keep that setup. Deleting the app can delete the volumes. Keep the same `SESSION_SECRET`, or saved mailbox secrets cannot be read. The first deploy after volumes are added starts from an empty volume.
+- `docker-compose.yml` keeps named volumes for the dashboard data, CUPS queues, and the print spool. Each printer's Tailscale state is inside the data volume. Redeploy the same Compose app to keep that setup. Deleting the app can delete the volumes. Keep the same `SESSION_SECRET`, or saved mailbox secrets cannot be read. The first deploy after volumes are added starts from an empty volume.
 - There is one admin account. Quotas, per-user roles, DKIM, and DMARC checks are outside this release.
 
 Screenshots in this repository were captured from the local dashboard with no printer, mailbox, or tailnet connected. CUPS, IMAP, and physical printers were not exercised for those images.

@@ -26,10 +26,18 @@ async def lifespan(app: FastAPI):
     thread = threading.Thread(target=mailer.run_loop, daemon=True, name='imap-poller')
     queue_thread = threading.Thread(target=printing.run_queue, daemon=True, name='print-queue')
     image_thread = threading.Thread(target=images.run_loop, daemon=True, name='printer-images')
+    snap_thread = None
     thread.start()
     queue_thread.start()
     image_thread.start()
+    if os.getenv('PRINTHARBOR_SNAPSHOTS', '1') != '0':
+        snap_thread = threading.Thread(target=printing.run_snapshots, daemon=True, name='printer-snapshots')
+        snap_thread.start()
     yield
+    try:
+        tailnet.stop_all()
+    except Exception:
+        pass
     mailer.STOP.set()
     printing.STOP.set()
     images.STOP.set()
@@ -37,6 +45,8 @@ async def lifespan(app: FastAPI):
     thread.join(timeout=4)
     queue_thread.join(timeout=2)
     image_thread.join(timeout=2)
+    if snap_thread:
+        snap_thread.join(timeout=1)
 
 secret = os.getenv('SESSION_SECRET', '')
 if len(secret) < 32 or secret.startswith('REPLACE_'):
@@ -102,12 +112,22 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
         if name and name not in shown:
             shown.append(name)
     printers = store.records('printers')
+    tail = tailnet.status()
+    by_queue = {item['queue']: item for item in (tail.get('devices') or [])}
+    for printer in printers:
+        printer['tail'] = by_queue.get(printer['queue']) or {
+            'online': False,
+            'hostname': printer.get('tail_hostname') or '',
+            'ip': printer.get('tail_ip') or '',
+            'state': 'Not joined',
+        }
     edit_name = (request.query_params.get('edit') or '').strip()
     editing = next((item for item in printers if item['queue'] == edit_name), None)
     if page in ('overview', 'printers'):
         for printer in printers:
-            printer['online'] = printing.printer_reachable(printer['host'], printer['protocol'])
-            printer['stats'] = printing.printer_stats(printer['host'], printer.get('identity') or printer.get('label') or '') if printer['online'] else None
+            printer['online'], printer['stats'] = printing.page_snapshot(
+                printer['host'], printer['protocol'], printer.get('identity') or printer.get('label') or '',
+            )
             printer['condition'] = printing.condition(printer['stats'], printer['online'])
             printer['supply'] = supplies.replacement_for(printer.get('identity') or printer.get('label') or '')
             printer['image'] = images.describe(printer)
@@ -133,7 +153,7 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
         'counts': counts,
         'mail': mailer.snapshot(),
         'events': store.records('events', 12) if page == 'overview' else [],
-        'tail': tailnet.status(),
+        'tail': tail,
         'tail_dismissed': bool(request.session.get('tail_dismissed')),
         'active_jobs': printing.active_jobs() if page == 'jobs' else EMPTY_CUPS,
         'cups_report': printing.cups_printers() if page == 'printers' else EMPTY_CUPS,
@@ -152,10 +172,10 @@ def index(request: Request, page: str = 'overview'):
     )
 
 @app.post('/printers/add')
-def add_printer(request: Request, token: str = Form(...), label: str = Form(...), queue: str = Form(...), host: str = Form(...), protocol: str = Form('socket')):
+def add_printer(request: Request, token: str = Form(...), label: str = Form(...), queue: str = Form(...), host: str = Form(...), protocol: str = Form('socket'), auth_key: str = Form(''), tail_hostname: str = Form('')):
     csrf(request, token)
     try:
-        identity = printing.add_printer(label, queue, host, protocol)
+        identity = printing.add_printer(label, queue, host, protocol, auth_key, tail_hostname)
         if not store.settings().get('default_queue'):
             store.set_setting('default_queue', queue)
         return nextpage('printers', f'Printer added: {identity}'[:180])
@@ -453,25 +473,31 @@ def tailscale_dismiss(request: Request, token: str = Form(...), page: str = Form
         page = 'overview'
     return RedirectResponse('/' if page == 'overview' else f'/?page={page}', status_code=303)
 
-@app.post('/tailscale/up')
-def tailscale_up(request: Request, token: str = Form(...), auth_key: str = Form(...), hostname: str = Form('printharbor')):
+@app.post('/printers/tailscale')
+def printer_tailscale(
+    request: Request,
+    token: str = Form(...),
+    queue: str = Form(...),
+    action: str = Form(...),
+    auth_key: str = Form(''),
+    hostname: str = Form(''),
+    page: str = Form('tailscale'),
+):
     csrf(request, token)
+    if page not in ('printers', 'tailscale'):
+        page = 'tailscale'
     try:
-        tailnet.connect(auth_key, hostname)
-        store.event('info', 'Tailscale joined the tailnet')
-        return nextpage('tailscale', 'Tailscale connected')
+        if action == 'leave':
+            printing.leave_tailnet(queue)
+            return nextpage(page, 'Printer left the tailnet')
+        if action != 'join':
+            return nextpage(page, error='Choose whether this printer joins or leaves the tailnet')
+        info = printing.join_tailnet(queue, auth_key, hostname)
+        name = (info or {}).get('hostname') or queue
+        store.event('info', f'{queue} joined the tailnet as {name}')
+        return nextpage(page, f'{name} joined the tailnet')
     except Exception as exc:
-        return nextpage('tailscale', error=str(exc))
-
-@app.post('/tailscale/down')
-def tailscale_down(request: Request, token: str = Form(...)):
-    csrf(request, token)
-    try:
-        tailnet.disconnect()
-        store.event('info', 'Tailscale logged out')
-        return nextpage('tailscale', 'Tailscale logged out')
-    except Exception as exc:
-        return nextpage('tailscale', error=str(exc))
+        return nextpage(page, error=str(exc))
 
 @app.get('/api/health')
 def health(request: Request):

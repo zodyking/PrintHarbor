@@ -2,7 +2,9 @@
 import json
 import os
 import re
+import socket
 import tempfile
+import threading
 import unittest
 from email.message import EmailMessage
 from pathlib import Path
@@ -17,10 +19,15 @@ os.environ['DATA_DIR']=_temp.name
 
 from app import brother, images, mailer, printing, store, supplies, tailnet
 
+os.environ['PRINTHARBOR_SNAPSHOTS'] = '0'
+
 class CoreTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
         store.initialize()
+
+    def setUp(self):
+        printing.clear_snapshots()
 
     def test_commands(self):
         self.assertEqual(mailer.parse_command('PRINT PIN:abcDEF12 DUPLEX COPIES=3','abcdef12'),
@@ -75,6 +82,8 @@ class CoreTests(unittest.TestCase):
             out=mailer.handle_message(msg,'test-mail-uid-1',cfg)
             self.assertEqual(out['jobs'],1)
             self.assertIn('sides=two-sided-long-edge',fake.call_args.args)
+            self.assertIn('print-scaling=auto',fake.call_args.args)
+            self.assertIn('media=Letter',fake.call_args.args)
             self.assertIn('2',fake.call_args.args)
             out2=mailer.handle_message(msg,'test-mail-uid-1',cfg)
             self.assertEqual(out2['jobs'],1)
@@ -546,7 +555,7 @@ class CoreTests(unittest.TestCase):
                 ('/?page=printers','Add a printer'),
                 ('/?page=jobs','Job log'),
                 ('/?page=email','Allowed senders'),
-                ('/?page=tailscale','Join this container to your tailnet'),
+                ('/?page=tailscale','Each printer joins as its own tailnet device'),
             ):
                 body=client.get(path)
                 self.assertEqual(body.status_code,200,path)
@@ -968,37 +977,183 @@ class CoreTests(unittest.TestCase):
 
     def test_tailscale_rejects_a_bad_key_before_calling_the_client(self):
         with self.assertRaises(tailnet.TailscaleError):
-            tailnet.connect('not-a-key', 'printharbor')
-        with patch('app.tailnet.shutil.which', return_value='/usr/bin/tailscale'), patch('app.tailnet.Path.exists', return_value=True), patch('app.tailnet._run') as run:
+            tailnet.connect('TailKey', 'not-a-key', 'printharbor')
+        with self.assertRaises(tailnet.TailscaleError):
+            tailnet.connect('../evil', 'tskey-auth-' + ('a' * 24), 'printer')
+        with patch('app.tailnet.shutil.which', return_value='/usr/bin/tailscale'), patch('app.tailnet._start_daemon') as start, patch('app.tailnet._run') as run:
             with self.assertRaises(tailnet.TailscaleError):
-                tailnet.connect('tskey-auth-' + ('a' * 24), 'Bad Host')
+                tailnet.connect('TailKey', 'tskey-auth-' + ('a' * 24), 'Bad Host')
+            start.assert_not_called()
             run.assert_not_called()
             key = 'tskey-auth-' + ('b' * 24)
             run.return_value = SimpleNamespace(returncode=1, stdout='', stderr='rejected ' + key)
             with self.assertRaises(tailnet.TailscaleError) as caught:
-                tailnet.connect(key, 'printharbor')
+                tailnet.connect('TailKey', key, 'office-printer')
             self.assertNotIn(key, str(caught.exception))
+            command = run.call_args[0][0]
+            self.assertIn(tailnet.socket_for('TailKey'), command)
+            self.assertNotIn(tailnet.socket_for('TailShop'), command)
 
     def test_tailscale_form_and_unauthenticated_join(self):
         from fastapi.testclient import TestClient
         from app.main import app
-        with TestClient(app) as client:
-            denied = client.post('/tailscale/up', data={'token': 'x', 'auth_key': 'tskey-auth-secret', 'hostname': 'printharbor'}, follow_redirects=False)
-            self.assertEqual(denied.status_code, 303)
-            self.assertIn('/login', denied.headers['location'])
-            client.post('/login', data={'username': 'admin', 'password': os.environ['ADMIN_PASSWORD']}, follow_redirects=False)
-            ready = {
-                'state': 'NeedsLogin', 'ip': '', 'hostname': '', 'online': False,
-                'installed': True, 'tun': True, 'detail': 'Paste an auth key to join the tailnet.',
-            }
-            with patch('app.tailnet.status', return_value=ready):
-                page = client.get('/?page=tailscale')
-                self.assertIn('Auth key', page.text)
-                self.assertNotIn('type="password" value=', page.text)
-                token = re.search(r'name="token" value="([^"]+)"', page.text).group(1)
-            bad = client.post('/tailscale/up', data={'token': token, 'auth_key': 'not-a-key', 'hostname': 'printharbor'}, follow_redirects=False)
-            self.assertIn('error=', bad.headers['location'])
-            self.assertNotIn('not-a-key', bad.headers['location'])
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='TailNode'")
+            db.execute("INSERT INTO printers(queue,label,host,protocol) VALUES('TailNode','Tail Node','192.0.2.25','socket')")
+        try:
+            with TestClient(app) as client:
+                denied = client.post('/printers/tailscale', data={'token': 'x', 'queue': 'TailNode', 'action': 'join', 'auth_key': 'tskey-auth-secret', 'hostname': 'tail-node'}, follow_redirects=False)
+                self.assertEqual(denied.status_code, 303)
+                self.assertIn('/login', denied.headers['location'])
+                client.post('/login', data={'username': 'admin', 'password': os.environ['ADMIN_PASSWORD']}, follow_redirects=False)
+                ready = {
+                    'state': 'Not connected', 'ip': '', 'hostname': '', 'online': False,
+                    'installed': True, 'tun': True, 'detail': 'No printer device is signed in.',
+                    'devices': [],
+                }
+                with patch('app.tailnet.status', return_value=ready):
+                    page = client.get('/?page=tailscale')
+                    self.assertIn('TailNode', page.text)
+                    self.assertIn('Auth key', page.text)
+                    self.assertNotIn('type="password" value=', page.text)
+                    token = re.search(r'name="token" value="([^"]+)"', page.text).group(1)
+                bad = client.post('/printers/tailscale', data={'token': token, 'queue': 'TailNode', 'action': 'join', 'auth_key': 'not-a-key', 'hostname': 'tail-node', 'page': 'tailscale'}, follow_redirects=False)
+                self.assertIn('error=', bad.headers['location'])
+                self.assertNotIn('not-a-key', bad.headers['location'])
+        finally:
+            with store.connection() as db:
+                db.execute("DELETE FROM printers WHERE queue='TailNode'")
+
+    def test_each_printer_keeps_its_own_tailnet_device(self):
+        self.assertNotEqual(tailnet.socket_for('TailOffice'), tailnet.socket_for('TailShop'))
+        self.assertEqual(Path(tailnet.state_for('TailOffice')).parent.name, 'TailOffice')
+        self.assertEqual(Path(tailnet.state_for('TailShop')).parent.name, 'TailShop')
+        self.assertEqual(tailnet.hostname_for('Brother HL-L2380DW', 'TailOffice'), 'brother-hl-l2380dw')
+        self.assertEqual(tailnet.local_forward('TailShop', '192.0.2.41', 9100), 0)
+        echo = socket.socket()
+        echo.bind(('127.0.0.1', 0))
+        echo.listen(4)
+        echo.settimeout(0.5)
+        echo_port = echo.getsockname()[1]
+        proxy = socket.socket()
+        proxy.bind(('127.0.0.1', 0))
+        proxy.listen(4)
+        proxy.settimeout(0.5)
+        proxy_port = proxy.getsockname()[1]
+        stop = threading.Event()
+
+        def echoes():
+            while not stop.is_set():
+                try:
+                    conn, _ = echo.accept()
+                except OSError:
+                    continue
+                try:
+                    conn.settimeout(2)
+                    data = conn.recv(32)
+                    conn.sendall(b'pong:' + data)
+                finally:
+                    conn.close()
+
+        def handle(client):
+            remote = None
+            try:
+                client.settimeout(2)
+                intro = b''
+                while len(intro) < 3:
+                    intro += client.recv(3 - len(intro))
+                client.sendall(b'\x05\x00')
+                req = b''
+                while len(req) < 10:
+                    req += client.recv(10 - len(req))
+                remote = socket.create_connection(('127.0.0.1', echo_port), timeout=2)
+                client.sendall(b'\x05\x00\x00\x01\x7f\x00\x00\x01\x00\x00')
+                def pump(src, dst):
+                    try:
+                        while True:
+                            chunk = src.recv(64)
+                            if not chunk:
+                                break
+                            dst.sendall(chunk)
+                    except OSError:
+                        pass
+                left = threading.Thread(target=pump, args=(client, remote), daemon=True)
+                right = threading.Thread(target=pump, args=(remote, client), daemon=True)
+                left.start()
+                right.start()
+                left.join(2)
+                right.join(2)
+            except OSError:
+                pass
+            finally:
+                client.close()
+                if remote:
+                    remote.close()
+
+        def proxies():
+            while not stop.is_set():
+                try:
+                    client, _ = proxy.accept()
+                except OSError:
+                    continue
+                threading.Thread(target=handle, args=(client,), daemon=True).start()
+
+        echo_thread = threading.Thread(target=echoes, daemon=True)
+        proxy_thread = threading.Thread(target=proxies, daemon=True)
+        echo_thread.start()
+        proxy_thread.start()
+        try:
+            tailnet.assign_proxy('TailOffice', proxy_port)
+            tailnet.bind_host('TailOffice', '192.0.2.40')
+            via = tailnet.open_tcp('192.0.2.40', echo_port, 2)
+            via.settimeout(2)
+            via.sendall(b'ping')
+            self.assertEqual(via.recv(16), b'pong:ping')
+            via.close()
+            uri = printing.device_uri('TailOffice', '192.0.2.40', 'socket')
+            self.assertTrue(uri.startswith('socket://127.0.0.1:'), uri)
+            local_port = int(uri.rsplit(':', 1)[1])
+            cups = socket.create_connection(('127.0.0.1', local_port), timeout=2)
+            cups.settimeout(2)
+            cups.sendall(b'cups')
+            self.assertEqual(cups.recv(16), b'pong:cups')
+            cups.close()
+            with patch('socket.create_connection', side_effect=OSError('direct')):
+                with self.assertRaises(OSError):
+                    tailnet.open_tcp('192.0.2.41', 9, 1)
+        finally:
+            stop.set()
+            echo.close()
+            proxy.close()
+            tailnet.disconnect('TailOffice')
+            tailnet.disconnect('TailShop')
+            self.assertEqual(printing.device_uri('TailOffice', '192.0.2.40', 'socket'), 'socket://192.0.2.40:9100')
+
+    def test_joined_printer_is_saved_when_it_does_not_answer(self):
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='TailWait'")
+        try:
+            with patch.object(tailnet, 'connect', return_value={'hostname': 'office-brother', 'ip': '100.64.0.9', 'online': True}) as connect, \
+                 patch.object(printing, 'discover_printer', return_value={'reachable': False}), \
+                 patch.object(printing, 'configure_queue') as configure:
+                label = printing.add_printer('Office Brother', 'TailWait', '192.0.2.40', 'socket', 'tskey-auth-' + ('c' * 24), 'office-brother')
+            self.assertIn('waiting', label)
+            self.assertEqual(connect.call_args[0][0], 'TailWait')
+            configure.assert_not_called()
+            with store.connection() as db:
+                row = db.execute('SELECT tail_hostname, driver FROM printers WHERE queue=?', ('TailWait',)).fetchone()
+            self.assertEqual(row['tail_hostname'], 'office-brother')
+            self.assertEqual(row['driver'], '')
+            with patch.object(printing, 'cmd', return_value=SimpleNamespace(returncode=0, stdout='', stderr='')), \
+                 patch.object(tailnet, 'disconnect') as down:
+                printing.remove_printer('TailWait')
+            down.assert_called_once_with('TailWait')
+        finally:
+            with store.connection() as db:
+                db.execute("DELETE FROM printers WHERE queue='TailWait'")
+            tailnet.bind_host('TailWait', '192.0.2.40')
+            with tailnet._LOCK:
+                tailnet._HOSTS.pop('192.0.2.40', None)
 
     def test_folder_watch_ignores_mail_already_present(self):
         self.assertEqual(mailer.uids_after(b'4 5 9', 5), [b'9'])
@@ -1018,6 +1173,48 @@ class CoreTests(unittest.TestCase):
         last, primed=mailer.adopt_cursor(again, 9, 3)
         self.assertTrue(primed)
         self.assertEqual(last, 2)
+
+    def test_mailbox_drop_is_not_shown_as_a_failure(self):
+        mailer._DROPS.clear()
+        mailer._DROP_WARNED = False
+        store.event('error', 'Mail check failed: cannot read from timed out object')
+        store.event('error', 'Mail check failed: Mailbox connection closed')
+        store.event('success', 'Job 23 sent to Office_Printer: image0.jpeg')
+        store.forget_transient_mail()
+        messages = [row['message'] for row in store.records('events', 30)]
+        self.assertNotIn('Mail check failed: cannot read from timed out object', messages)
+        self.assertNotIn('Mail check failed: Mailbox connection closed', messages)
+        self.assertIn('Job 23 sent to Office_Printer: image0.jpeg', messages)
+        mailer.note_mail_drop('cannot read from timed out object')
+        self.assertEqual(mailer.snapshot()['state'], 'Watching')
+        self.assertFalse(any(row['message'].startswith('The mailbox connection keeps') for row in store.records('events', 10)))
+        for _ in range(3):
+            mailer.note_mail_drop('Mailbox connection closed')
+        warned = [row['message'] for row in store.records('events', 10)]
+        self.assertTrue(any(item.startswith('The mailbox connection keeps') for item in warned))
+        self.assertTrue(mailer._transient_mail('The read operation timed out'))
+        self.assertFalse(mailer._transient_mail('AUTHENTICATIONFAILED'))
+
+    def test_photo_fits_the_page_without_a_wide_margin(self):
+        x, y, width, height = printing.image_box(4000, 3000)
+        self.assertAlmostEqual(width, 576)
+        self.assertAlmostEqual(x, 18)
+        self.assertGreater(y, 100)
+        self.assertAlmostEqual(x + width + x, 612)
+        from io import BytesIO
+        from PIL import Image
+        from pypdf import PdfReader
+        buf = BytesIO()
+        Image.new('RGB', (80, 40), (10, 20, 30)).save(buf, 'JPEG', quality=85)
+        path, pages = printing.prepare_bytes('image0.jpg', buf.getvalue(), 5)
+        try:
+            self.assertEqual(pages, 1)
+            reader = PdfReader(path)
+            box = reader.pages[0].mediabox
+            self.assertAlmostEqual(float(box.width), 612)
+            self.assertAlmostEqual(float(box.height), 792)
+        finally:
+            Path(path).unlink(missing_ok=True)
 
     def test_idle_returns_when_the_folder_changes(self):
         lines=[b'+ idling\r\n', b'* 3 EXISTS\r\n', b'T1 OK IDLE terminated\r\n']
@@ -1040,8 +1237,7 @@ class CoreTests(unittest.TestCase):
         conn=Stub()
         mailer.STOP.clear()
         try:
-            with patch('app.mailer.select.select', return_value=([True], [], [])):
-                self.assertTrue(mailer.wait_for_new_mail(conn, seconds=5))
+            self.assertTrue(mailer.wait_for_new_mail(conn, seconds=5))
         finally:
             mailer.STOP.set()
         self.assertTrue(any(item.endswith(b'IDLE\r\n') for item in conn.sent))

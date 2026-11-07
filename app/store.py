@@ -68,6 +68,7 @@ def initialize():
         CREATE TABLE IF NOT EXISTS printers (
             queue TEXT PRIMARY KEY, label TEXT NOT NULL, host TEXT NOT NULL,
             protocol TEXT NOT NULL, identity TEXT DEFAULT '', driver TEXT DEFAULT '',
+            tail_hostname TEXT DEFAULT '', tail_ip TEXT DEFAULT '',
             created_at TEXT DEFAULT CURRENT_TIMESTAMP
         );
         CREATE TABLE IF NOT EXISTS jobs (
@@ -119,6 +120,10 @@ def initialize():
             db.execute("ALTER TABLE printers ADD COLUMN identity TEXT DEFAULT ''")
         if 'driver' not in columns:
             db.execute("ALTER TABLE printers ADD COLUMN driver TEXT DEFAULT ''")
+        if 'tail_hostname' not in columns:
+            db.execute("ALTER TABLE printers ADD COLUMN tail_hostname TEXT DEFAULT ''")
+        if 'tail_ip' not in columns:
+            db.execute("ALTER TABLE printers ADD COLUMN tail_ip TEXT DEFAULT ''")
         for name, kind in (
             ('image_mode', "TEXT DEFAULT 'auto'"),
             ('image_key', "TEXT DEFAULT ''"),
@@ -140,7 +145,20 @@ def initialize():
             "UPDATE jobs SET status='error', error=? WHERE status='sending'",
             ('Interrupted while sending to the printer',),
         )
+        forget_transient_mail(db)
     (ROOT / 'images').mkdir(parents=True, exist_ok=True)
+
+def forget_transient_mail(db=None):
+    """Drop mailbox reconnect noise. A dropped IDLE connection is not a print failure."""
+    sql = '''DELETE FROM events WHERE message LIKE 'Mail check failed: %'
+        AND (message LIKE '%timed out%' OR message LIKE '%connection closed%'
+             OR message LIKE '%connection reset%' OR message LIKE '%cannot read from timed out%'
+             OR message LIKE '%Mailbox watch stopped%')'''
+    if db is not None:
+        db.execute(sql)
+        return
+    with connection() as handle:
+        handle.execute(sql)
 
 def verify_user(username, password):
     with connection() as db:

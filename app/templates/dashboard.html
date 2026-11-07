@@ -64,6 +64,35 @@
   </dl>
 </div>
 {% endmacro %}
+{% macro tail_form(p, return_page) %}
+<div class="tail-device">
+  {% if p.tail.online %}
+  <p class="form-help">{{ p.tail.hostname or p.label }}{% if p.tail.ip %} · {{ p.tail.ip }}{% endif %}</p>
+  {% elif p.tail.hostname %}
+  <p class="form-help">{{ p.tail.hostname }} is signed out.</p>
+  {% else %}
+  <p class="form-help">This printer is not a tailnet device yet.</p>
+  {% endif %}
+  {% if p.tail.hostname or p.tail.online %}
+  <form method="post" action="/printers/tailscale" class="form-stack" onsubmit="return confirm('Remove {{ p.label }} from the tailnet?')">
+    <input type="hidden" name="token" value="{{ token }}">
+    <input type="hidden" name="queue" value="{{ p.queue }}">
+    <input type="hidden" name="action" value="leave">
+    <input type="hidden" name="page" value="{{ return_page }}">
+    <button class="button subtle" type="submit">Remove this device</button>
+  </form>
+  {% endif %}
+  <form method="post" action="/printers/tailscale" class="form-stack">
+    <input type="hidden" name="token" value="{{ token }}">
+    <input type="hidden" name="queue" value="{{ p.queue }}">
+    <input type="hidden" name="action" value="join">
+    <input type="hidden" name="page" value="{{ return_page }}">
+    <label>Auth key<input name="auth_key" type="password" required autocomplete="off" spellcheck="false" placeholder="tskey-auth-..."><small>Used once to join this printer. It is not saved.</small></label>
+    <label>Device hostname<input name="hostname" value="{{ p.tail.hostname }}" maxlength="63" autocapitalize="off" spellcheck="false" placeholder="office-brother" pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"><small>The name of this printer in your tailnet.</small></label>
+    <button class="button" type="submit">Join as its own device <span aria-hidden="true">→</span></button>
+  </form>
+</div>
+{% endmacro %}
 <!doctype html>
 <html lang="en">
 <head>
@@ -71,7 +100,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/style.css?v=18">
+  <link rel="stylesheet" href="/static/style.css?v=19">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
@@ -176,7 +205,7 @@
             {% for p in printers %}
             {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
             <div class="printer-block">
-              <div class="printer-line expand"><img class="printer-thumb" src="/printer-images/{{ p.queue }}" alt="" width="44" height="44" {% if p.image.pending %}data-pending="1"{% endif %}><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}</small><small>{{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% endif %}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
+              <div class="printer-line expand"><img class="printer-thumb" src="/printer-images/{{ p.queue }}" alt="" width="44" height="44" {% if p.image.pending %}data-pending="1"{% endif %}><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}</small><small>{{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% endif %}</small><small>{% if p.tail.online %}Tailnet device{% if p.tail.hostname %} {{ p.tail.hostname }}{% endif %}{% if p.tail.ip %} · {{ p.tail.ip }}{% endif %}{% elif p.tail.hostname %}Tailnet device {{ p.tail.hostname }} · signed out{% else %}Not a tailnet device{% endif %}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
               {{ printer_station(p) }}
               {% if p.online and p.stats and (p.stats.pages_label or p.stats.serial or p.stats.firmware) %}
               <p class="station-facts">{% if p.stats.pages_label %}<span>Pages <strong>{{ p.stats.pages_label }}</strong></span>{% endif %}{% if p.stats.serial %}<span>Serial <strong>{{ p.stats.serial }}</strong></span>{% endif %}{% if p.stats.firmware %}<span>Firmware <strong>{{ p.stats.firmware }}</strong></span>{% endif %}</p>
@@ -202,6 +231,10 @@
                 <button class="button subtle" type="submit">Save settings</button>
               </form>
               {% endif %}
+              <details class="image-change">
+                <summary>Tailscale device</summary>
+                {{ tail_form(p, 'printers') }}
+              </details>
               <details class="image-change" {% if image_preview == p.queue %}open{% endif %}>
                 <summary>Change printer image</summary>
                 <form class="form-stack" method="post" action="/printers/image" enctype="multipart/form-data">
@@ -284,6 +317,14 @@
             <label>Queue name<input name="queue" placeholder="Office" required pattern="[A-Za-z][A-Za-z0-9_-]{0,40}" maxlength="41" autocapitalize="off" spellcheck="false"></label>
             <label>Printer IPv4<input name="host" required placeholder="192.168.50.40" inputmode="decimal" autocomplete="off" spellcheck="false" aria-describedby="printer-help"></label>
             <p id="printer-help" class="form-help">PrintHarbor reads the make and model, then picks a matching driver. Driver settings can be changed on the printer after it is added.</p>
+            <label>Tailscale auth key
+              <input name="auth_key" type="password" autocomplete="off" spellcheck="false" placeholder="tskey-auth-...">
+              <small>Optional. Joins this printer as its own tailnet device. The key is used once and is not saved.</small>
+            </label>
+            <label>Device hostname
+              <input name="tail_hostname" maxlength="63" autocapitalize="off" spellcheck="false" placeholder="office-brother" pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?">
+              <small>Leave blank to build a name from the display name.</small>
+            </label>
             <button class="button" type="submit">Create printer queue <span aria-hidden="true">→</span></button>
           </form>
           {% endif %}
@@ -303,43 +344,39 @@
         <h2 id="route-title">Tailscale route</h2>
         <div class="check-grid">
           <div><b>01</b><strong>Subnet route to the printer</strong><p>An always-on device on the printer LAN must advertise that printer's address, preferably as a /32.</p></div>
-          <div><b>02</b><strong>Approve the route</strong><p>Approve it in the Tailscale admin console and allow this node in the tailnet policy.</p></div>
-          <div><b>03</b><strong>Use the printer LAN address</strong><p>After this container joins the tailnet, enter that LAN address above, not a public address.</p></div>
+          <div><b>02</b><strong>Approve it for this printer</strong><p>Approve the route for that printer's own tailnet device, not for a shared node.</p></div>
+          <div><b>03</b><strong>Join the printer</strong><p>Give this printer its own auth key. Print traffic then leaves through that device.</p></div>
         </div>
       </section>
     {% elif page=='tailscale' %}
-      <div class="headerline"><div><h1>Tailscale</h1><p class="muted">Join this container to your tailnet so it can reach a printer on another network.</p></div></div>
-      {% if tail.online %}
-      <section class="panel" aria-labelledby="tail-status-title">
-        <div class="panelhead"><div><h2 id="tail-status-title">Connected</h2><p>{{ tail.hostname or 'This node' }} is on the tailnet.</p></div><span class="status online">Running</span></div>
-        <p class="form-help">Tailnet address: {{ tail.ip or 'assigned' }}. Advertised printer routes must still be approved in the Tailscale admin console. Then add the printer by its LAN address.</p>
-        <form method="post" action="/tailscale/down" class="form-stack">
-          <input type="hidden" name="token" value="{{ token }}">
-          <button class="button subtle" type="submit">Log out of Tailscale</button>
-        </form>
+      <div class="headerline"><div><h1>Tailscale</h1><p class="muted">Each printer joins as its own tailnet device.</p></div></div>
+      {% if not tail.installed %}
+      <section class="panel" aria-labelledby="tail-blocked-title">
+        <div class="panelhead"><div><h2 id="tail-blocked-title">Tailscale is not installed</h2><p>{{ tail.detail }}</p></div></div>
       </section>
-      {% elif tail.installed and tail.tun %}
+      {% elif printers %}
       <section class="panel" aria-labelledby="tail-join-title">
-        <div class="panelhead"><div><h2 id="tail-join-title">Join the tailnet</h2><p>Create a reusable auth key in the Tailscale admin console. An ephemeral key is the right kind for this container.</p></div></div>
-        <form method="post" action="/tailscale/up" class="form-stack">
-          <input type="hidden" name="token" value="{{ token }}">
-          <label>Auth key<input name="auth_key" type="password" required autocomplete="off" spellcheck="false" placeholder="tskey-auth-..."><small>Used once to join. It is not saved in PrintHarbor.</small></label>
-          <label>Hostname<input name="hostname" value="printharbor" maxlength="63" autocapitalize="off" spellcheck="false" pattern="[A-Za-z0-9](?:[A-Za-z0-9-]{0,61}[A-Za-z0-9])?"><small>The name of this node in your tailnet.</small></label>
-          <button class="button" type="submit">Connect Tailscale <span aria-hidden="true">→</span></button>
-        </form>
+        <div class="panelhead"><div><h2 id="tail-join-title">Printer devices</h2><p>{{ tail.detail }} An auth key is used once and is not saved.</p></div>{% if tail.online %}<span class="status online">{{ tail.state }}</span>{% endif %}</div>
+        <div class="printer-list">
+          {% for p in printers %}
+          <div class="printer-block">
+            <div class="printer-line"><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.host }}</small></div><span class="status {% if p.tail.online %}online{% else %}offline{% endif %}">{{ p.tail.state }}</span></div>
+            {{ tail_form(p, 'tailscale') }}
+          </div>
+          {% endfor %}
+        </div>
       </section>
       {% else %}
-      <section class="panel" aria-labelledby="tail-blocked-title">
-        <div class="panelhead"><div><h2 id="tail-blocked-title">Tailscale needs the tunnel device</h2><p>{{ tail.detail }}</p></div></div>
-        <p class="form-help">A normal Dokploy application cannot open <code>/dev/net/tun</code>. Create a Compose application instead, with compose file <code>docker-compose.yml</code>, the same <code>SESSION_SECRET</code> and <code>ADMIN_PASSWORD</code>, and the domain pointed at port 47831. After that deploy, this page accepts an auth key.</p>
+      <section class="panel" aria-labelledby="tail-empty-title">
+        <div class="panelhead"><div><h2 id="tail-empty-title">No printers yet</h2><p>Add a printer, then join it here as its own device.</p></div></div>
       </section>
       {% endif %}
       <section class="panel" aria-labelledby="tail-notes-title">
-        <div class="panelhead"><div><h2 id="tail-notes-title">Before you print</h2><p>The tailnet only helps when the printer's own address is approved.</p></div></div>
+        <div class="panelhead"><div><h2 id="tail-notes-title">Before you print</h2><p>A printer device can only reach an address a device on that LAN advertises.</p></div></div>
         <div class="check-grid">
           <div><b>01</b><strong>Advertise the printer</strong><p>An always-on device on the printer LAN should advertise that address, preferably as a /32.</p></div>
-          <div><b>02</b><strong>Approve the route</strong><p>Approve it in the Tailscale admin console and allow this node in the tailnet policy.</p></div>
-          <div><b>03</b><strong>Use the LAN address</strong><p>Add the printer with that LAN address, not a public address.</p></div>
+          <div><b>02</b><strong>Approve the route</strong><p>Approve it for this printer's device in the Tailscale admin console.</p></div>
+          <div><b>03</b><strong>Use the LAN address</strong><p>Add the printer with that LAN address. Print and IPP traffic use this device. SNMP supply readings stay on the local network.</p></div>
         </div>
       </section>
     {% elif page=='jobs' %}

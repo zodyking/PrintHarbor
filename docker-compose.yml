@@ -4,10 +4,6 @@ services:
   printharbor:
     build: .
     restart: unless-stopped
-    cap_add:
-      - NET_ADMIN
-    devices:
-      - /dev/net/tun:/dev/net/tun
     environment:
       DATA_DIR: /data
       SESSION_SECRET: ${SESSION_SECRET:?Set SESSION_SECRET}
@@ -19,10 +15,8 @@ services:
       - printharbor-data:/data
       - printharbor-cups:/etc/cups
       - printharbor-spool:/var/spool/cups
-      - printharbor-tailscale:/var/lib/tailscale
 
 volumes:
   printharbor-data:
   printharbor-cups:
   printharbor-spool:
-  printharbor-tailscale:

@@ -10,14 +10,14 @@ import threading
 import time
 import uuid
 from pathlib import Path
-from PIL import Image, UnidentifiedImageError
+from PIL import Image, ImageOps, UnidentifiedImageError
 from pypdf import PdfReader, PdfWriter
 from reportlab.lib.colors import HexColor, white
 from reportlab.lib.pagesizes import letter
 from reportlab.lib.utils import ImageReader
 from reportlab.pdfbase.pdfmetrics import stringWidth
 from reportlab.pdfgen.canvas import Canvas
-from . import brother, store
+from . import brother, store, tailnet
 
 Image.MAX_IMAGE_PIXELS = 40_000_000
 
@@ -34,6 +34,9 @@ class PrintError(Exception):
 STOP = threading.Event()
 _QUEUE_LOCKS = {}
 _QUEUE_LOCKS_GUARD = threading.Lock()
+_SNAPSHOTS = {}
+_SNAPSHOT_GUARD = threading.Lock()
+SNAPSHOT_TTL = 30
 _NOTICE_AT = {}
 LOW_SUPPLY = 10
 
@@ -60,14 +63,64 @@ def interpret_lpstat(result):
         return {'ok': True, 'lines': [], 'error': ''}
     return {'ok': False, 'lines': [], 'error': (err or (result.stdout or '').strip() or 'lpstat failed')[:200]}
 
+def clear_snapshots():
+    with _SNAPSHOT_GUARD:
+        _SNAPSHOTS.clear()
+
+def remember_snapshot(host, protocol, online, stats):
+    with _SNAPSHOT_GUARD:
+        _SNAPSHOTS[(host, protocol or '')] = {
+            'at': time.monotonic(), 'online': bool(online), 'stats': stats,
+        }
+
+def page_snapshot(host, protocol, identity=''):
+    """The last printer reading, refreshed in the background so a page does not wait on the network."""
+    key = (host, protocol or '')
+    now = time.monotonic()
+    with _SNAPSHOT_GUARD:
+        row = _SNAPSHOTS.get(key)
+        if row and now - row['at'] < SNAPSHOT_TTL:
+            return row['online'], row['stats']
+    return read_snapshot(host, protocol, identity)
+
+def read_snapshot(host, protocol, identity=''):
+    online = printer_reachable(host, protocol, timeout=2)
+    stats = printer_stats(host, identity) if online else None
+    remember_snapshot(host, protocol, online, stats)
+    return online, stats
+
+def refresh_snapshots():
+    with store.connection() as db:
+        rows = db.execute('SELECT host, protocol, identity, label FROM printers').fetchall()
+    for row in rows:
+        if STOP.is_set():
+            return
+        try:
+            read_snapshot(row['host'], row['protocol'], row['identity'] or row['label'] or '')
+        except Exception:
+            continue
+
+def run_snapshots():
+    while not STOP.is_set():
+        try:
+            refresh_snapshots()
+        except Exception:
+            pass
+        STOP.wait(10)
+
 def printer_reachable(host, protocol, timeout=2):
     """A real connect to the printer port. Short enough to run before each document."""
     port = 631 if protocol == 'ipp' else 9100
     try:
-        with socket.create_connection((host, port), timeout=timeout):
+        with open_connection(host, port, timeout):
             return True
-    except OSError:
+    except (OSError, tailnet.TailscaleError):
         return False
+
+
+def open_connection(host, port, timeout):
+    """TCP to a printer. A joined printer is reached through its own device."""
+    return tailnet.open_tcp(host, port, timeout)
 
 def _ipv4(ip):
     try:
@@ -212,14 +265,14 @@ def ipp_attributes(host):
             if gave_up:
                 break
             try:
-                with socket.create_connection((host, 631), timeout=2) as sock:
+                with open_connection(host, 631, 2) as sock:
                     sock.settimeout(2)
                     sock.sendall(payload)
                     parsed = parse_ipp(_read_socket(sock))
             except TimeoutError:
                 gave_up = True
                 continue
-            except OSError:
+            except (OSError, tailnet.TailscaleError):
                 continue
             if parsed.get('printer-make-and-model') or parsed.get('printer-device-id') or parsed.get('printer-state'):
                 return parsed
@@ -231,7 +284,7 @@ def ipp_identity(host):
 def pjl_identity(host):
     query = b'\x1b%-12345X@PJL INFO ID\r\n\x1b%-12345X'
     try:
-        with socket.create_connection((host, 9100), timeout=3) as sock:
+        with open_connection(host, 9100, 3) as sock:
             sock.settimeout(2)
             sock.sendall(query)
             data = b''
@@ -240,7 +293,7 @@ def pjl_identity(host):
                 if not piece:
                     break
                 data += piece
-    except OSError:
+    except (OSError, tailnet.TailscaleError):
         return ''
     text = data.decode('latin-1', 'replace')
     match = re.search(r'INFO ID\s*\r?\n"([^"]+)"', text, re.I)
@@ -460,12 +513,57 @@ def apply_queue_options(queue, choices):
         store.event('success', f'Printer {queue} settings saved')
     return [key for key, _ in pairs]
 
+def device_uri(queue, address, protocol):
+    """CUPS cannot use SOCKS, so a joined printer is reached through a local forwarder."""
+    remote = 9100 if protocol == 'socket' else 631
+    local = 0
+    try:
+        local = tailnet.local_forward(queue, address, remote)
+    except Exception:
+        local = 0
+    if local:
+        if protocol == 'socket':
+            return f'socket://127.0.0.1:{local}'
+        return f'ipp://127.0.0.1:{local}/ipp/print'
+    if protocol == 'socket':
+        return f'socket://{address}:9100'
+    return f'ipp://{address}/ipp/print'
+
+
+def _point_queue(queue, uri):
+    try:
+        result = cmd('lpadmin', '-p', queue, '-v', uri, timeout=20)
+    except PrintError:
+        return
+    if result.returncode == 0:
+        return
+    text = (result.stderr or result.stdout or '').lower()
+    if 'unknown' in text or 'does not exist' in text or 'no such' in text:
+        return
+    raise PrintError((result.stderr or result.stdout or 'The printer queue could not be moved')[:400])
+
+
+def use_tail_route(queue, address, protocol):
+    uri = device_uri(queue, address, protocol or 'socket')
+    if '127.0.0.1' not in uri:
+        return
+    _point_queue(queue, uri)
+
+
+def use_direct_route(queue, address, protocol):
+    if protocol == 'socket':
+        uri = f'socket://{address}:9100'
+    else:
+        uri = f'ipp://{address}/ipp/print'
+    _point_queue(queue, uri)
+
+
 def configure_queue(queue, address, discovery, drivers, keep_options=False):
     choice = choose_driver(discovery, drivers)
     if not MODEL_RE.fullmatch(choice['model']):
         raise PrintError('The selected driver name was not usable')
     saved = [(item['key'], item['current']) for item in queue_options(queue)] if keep_options else []
-    uri = f'socket://{address}:9100' if choice['protocol'] == 'socket' else f'ipp://{address}/ipp/print'
+    uri = device_uri(queue, address, choice['protocol'])
     result = cmd('lpadmin', '-p', queue, '-E', '-v', uri, '-m', choice['model'], timeout=40)
     if result.returncode:
         raise PrintError((result.stderr or result.stdout or 'The printer could not be added')[:400])
@@ -486,29 +584,60 @@ def _note_image(queue):
     except Exception:
         store.event('warning', 'Printer image could not be queued')
 
-def _save_printer(queue, label, address, choice):
+def _save_printer(queue, label, address, choice, tail=None):
+    hostname = (tail or {}).get('hostname') or ''
+    ip = (tail or {}).get('ip') or ''
     with store.connection() as db:
         db.execute(
-            'INSERT INTO printers(queue,label,host,protocol,identity,driver) VALUES (?,?,?,?,?,?) '
+            'INSERT INTO printers(queue,label,host,protocol,identity,driver,tail_hostname,tail_ip) '
+            'VALUES (?,?,?,?,?,?,?,?) '
             'ON CONFLICT(queue) DO UPDATE SET label=excluded.label, host=excluded.host, '
             'protocol=excluded.protocol, identity=excluded.identity, driver=excluded.driver',
-            (queue, label[:100], address, choice['protocol'], choice['label'][:120], choice['driver'][:120]),
+            (
+                queue, label[:100], address, choice['protocol'],
+                (choice.get('label') or '')[:120], (choice.get('driver') or '')[:120],
+                hostname, ip,
+            ),
         )
 
-def add_printer(label, queue, ip, protocol='socket'):
+def add_printer(label, queue, ip, protocol='socket', tail_key='', tail_name=''):
     # Older forms posted a connection type. The printer is read and a driver is chosen instead.
     _ = protocol
     if not QUEUE_RE.fullmatch(queue):
         raise PrintError('Queue must begin with a letter and contain only letters, numbers, _ or -')
     address = _ipv4(ip)
-    discovery = discover_printer(address)
-    if not discovery.get('reachable'):
-        raise PrintError('The printer did not answer. Check the address and that this host can reach it.')
-    choice = configure_queue(queue, address, discovery, load_drivers())
-    _save_printer(queue, label, address, choice)
-    _note_image(queue)
-    store.event('success', f'Printer {queue} configured on {address} ({choice["label"][:80]})')
-    return choice['label']
+    joined = None
+    saved = False
+    try:
+        if str(tail_key or '').strip():
+            joined = tailnet.connect(queue, tail_key, tail_name, label)
+            tailnet.bind_host(queue, address)
+        discovery = discover_printer(address)
+        if not discovery.get('reachable'):
+            if not joined:
+                raise PrintError('The printer did not answer. Check the address and that this host can reach it.')
+            _save_printer(
+                queue, label, address,
+                {'protocol': 'socket', 'label': '', 'driver': ''},
+                joined,
+            )
+            saved = True
+            _note_image(queue)
+            store.event('warning', f'Printer {queue} joined the tailnet but did not answer')
+            return 'joined the tailnet, waiting for the printer'
+        choice = configure_queue(queue, address, discovery, load_drivers())
+        _save_printer(queue, label, address, choice, joined)
+        saved = True
+        _note_image(queue)
+        store.event('success', f'Printer {queue} configured on {address} ({choice["label"][:80]})')
+        return choice['label']
+    except Exception:
+        if joined and not saved:
+            try:
+                tailnet.disconnect(queue)
+            except Exception:
+                store.event('warning', f'Printer {queue} could not be saved, and its tailnet device may still be signed in')
+        raise
 
 def update_printer(queue, label, ip, reread=False):
     """Change a saved printer. A new address, or an explicit reread, selects the driver again."""
@@ -528,19 +657,31 @@ def update_printer(queue, label, ip, reread=False):
         _note_image(queue)
         store.event('success', f'Printer {queue} renamed to {name}')
         return (row['identity'] or name)[:120]
-    discovery = discover_printer(address)
-    if not discovery.get('reachable'):
-        raise PrintError('The printer did not answer. The saved printer was left unchanged.')
-    choice = configure_queue(queue, address, discovery, load_drivers(), keep_options=(address == row['host']))
-    _save_printer(queue, name, address, choice)
+    owned = tailnet.has_node(queue)
+    if owned:
+        tailnet.bind_host(queue, address)
+    try:
+        discovery = discover_printer(address)
+        if not discovery.get('reachable'):
+            raise PrintError('The printer did not answer. The saved printer was left unchanged.')
+        choice = configure_queue(queue, address, discovery, load_drivers(), keep_options=(address == row['host']))
+        _save_printer(queue, name, address, choice)
+    except Exception:
+        if owned:
+            tailnet.bind_host(queue, row['host'])
+        raise
     _note_image(queue)
     store.event('success', f'Printer {queue} updated on {address} ({choice["label"][:80]})')
     return choice['label']
 
 def retarget_saved_queues():
     """Re-read each saved printer and select its driver again."""
+    try:
+        tailnet.resume()
+    except Exception:
+        store.event('warning', 'Printer tailnet devices could not be resumed')
     with store.connection() as db:
-        rows = db.execute('SELECT queue, label, host FROM printers').fetchall()
+        rows = db.execute('SELECT queue, label, host, protocol FROM printers').fetchall()
     if not rows:
         return
     try:
@@ -557,6 +698,11 @@ def retarget_saved_queues():
             discovery = discover_printer(address)
             if not discovery.get('reachable'):
                 store.event('warning', f'Printer {queue} did not answer, so its driver was left as-is')
+                if tailnet.has_node(queue):
+                    try:
+                        use_tail_route(queue, address, row['protocol'] or 'socket')
+                    except Exception:
+                        pass
                 continue
             choice = configure_queue(queue, address, discovery, drivers, keep_options=True)
         except Exception as exc:
@@ -571,8 +717,42 @@ def remove_printer(queue):
     result = cmd('lpadmin', '-x', queue)
     if result.returncode:
         raise PrintError(result.stderr or 'Could not delete queue')
+    try:
+        tailnet.disconnect(queue)
+    except Exception:
+        store.event('warning', f'Printer {queue} was removed, but its tailnet device may still be signed in')
     with store.connection() as db:
         db.execute('DELETE FROM printers WHERE queue=?', (queue,))
+
+
+def join_tailnet(queue, auth_key, hostname):
+    if not QUEUE_RE.fullmatch(queue or ''):
+        raise PrintError('Invalid queue')
+    with store.connection() as db:
+        row = db.execute(
+            'SELECT label, host, protocol FROM printers WHERE queue=?',
+            (queue,),
+        ).fetchone()
+    if not row:
+        raise PrintError('Add the printer before joining it to the tailnet')
+    info = tailnet.connect(queue, auth_key, hostname, row['label'])
+    tailnet.bind_host(queue, row['host'])
+    try:
+        use_tail_route(queue, row['host'], row['protocol'] or 'socket')
+    except PrintError:
+        store.event('warning', f'Printer {queue} joined the tailnet. Its queue will use that device once the printer answers.')
+    return info
+
+
+def leave_tailnet(queue):
+    if not QUEUE_RE.fullmatch(queue or ''):
+        raise PrintError('Invalid queue')
+    with store.connection() as db:
+        row = db.execute('SELECT host, protocol FROM printers WHERE queue=?', (queue,)).fetchone()
+    if not row:
+        raise PrintError('Printer not found')
+    tailnet.disconnect(queue)
+    use_direct_route(queue, row['host'], row['protocol'] or 'socket')
 
 def active_jobs():
     try:
@@ -598,6 +778,28 @@ def _render_txt(txt, dest):
                 y = 750
     c.save()
 
+def image_box(width, height, page_w=612, page_h=792, margin=18):
+    """Fit a photo on a letter page, centered, inside a laser's unprintable edge."""
+    max_w = page_w - (2 * margin)
+    max_h = page_h - (2 * margin)
+    scale = min(max_w / max(width, 1), max_h / max(height, 1))
+    draw_w = width * scale
+    draw_h = height * scale
+    return (page_w - draw_w) / 2, (page_h - draw_h) / 2, draw_w, draw_h
+
+def _prepared_frame(frame):
+    turned = ImageOps.exif_transpose(frame) or frame
+    if turned.mode != 'RGB':
+        turned = turned.convert('RGB')
+    x, y, draw_w, draw_h = image_box(*turned.size)
+    target = (max(1, int(round(draw_w / 72 * 600))), max(1, int(round(draw_h / 72 * 600))))
+    if turned.size[0] > target[0] or turned.size[1] > target[1]:
+        turned = turned.resize(target, Image.Resampling.LANCZOS)
+    encoded = io.BytesIO()
+    turned.save(encoded, format='JPEG', quality=92, optimize=True)
+    encoded.seek(0)
+    return encoded, x, y, draw_w, draw_h
+
 def _images_to_pdf(data, dest, max_pages):
     try:
         with Image.open(io.BytesIO(data)) as src:
@@ -607,7 +809,7 @@ def _images_to_pdf(data, dest, max_pages):
             frames = []
             for index in range(count):
                 src.seek(index)
-                frames.append(src.convert('RGB').copy())
+                frames.append(_prepared_frame(src))
     except PrintError:
         raise
     except (UnidentifiedImageError, Image.DecompressionBombError, OSError) as exc:
@@ -615,14 +817,21 @@ def _images_to_pdf(data, dest, max_pages):
     if not frames:
         raise PrintError('Unable to read that image')
     pdf = Canvas(str(dest), pagesize=letter)
-    for index, frame in enumerate(frames):
+    for index, (encoded, x, y, draw_w, draw_h) in enumerate(frames):
         if index:
             pdf.showPage()
-        width, height = frame.size
-        scale = min(540 / max(width, 1), 720 / max(height, 1))
-        draw_w, draw_h = width * scale, height * scale
-        pdf.drawImage(ImageReader(frame), (612 - draw_w) / 2, (792 - draw_h) / 2, width=draw_w, height=draw_h)
+        pdf.drawImage(ImageReader(encoded), x, y, width=draw_w, height=draw_h, preserveAspectRatio=True, anchor='c')
     pdf.save()
+
+def send_to_queue(queue, copies, sides, path):
+    """Print a letter page without a second scale, which is what shifts the image."""
+    command = ['lp', '-d', queue, '-n', str(copies), '-o', 'sides=' + sides, '-o', 'print-scaling=auto', '-o', 'media=Letter', path]
+    result = cmd(*command, timeout=35)
+    text = ((result.stderr or '') + (result.stdout or '')).lower()
+    if result.returncode and 'media' in text:
+        command = ['lp', '-d', queue, '-n', str(copies), '-o', 'sides=' + sides, '-o', 'print-scaling=auto', path]
+        result = cmd(*command, timeout=35)
+    return result
 
 def _safe_filename(filename):
     name = Path(str(filename or 'document')).name.strip()
@@ -945,7 +1154,7 @@ def print_supply_notice(queue, hold):
     path = folder / f'notice-{uuid.uuid4().hex}.pdf'
     try:
         _notice_pdf(path, hold)
-        result = cmd('lp', '-d', queue, '-n', '1', '-o', 'sides=one-sided', str(path), timeout=35)
+        result = send_to_queue(queue, '1', 'one-sided', str(path))
     except Exception:
         store.event('warning', 'The supply notice could not be printed')
         return False
@@ -1105,7 +1314,7 @@ def run_queue():
             release_queues()
         except Exception:
             store.event('warning', 'The print queue could not be checked')
-        STOP.wait(0.4)
+        STOP.wait(3)
 
 def requeue(job_id):
     with store.connection() as db:
@@ -1138,8 +1347,7 @@ def dispatch(job_id):
     print_path = record['filepath']
     try:
         print_path = sheet_for_duplex(record['filepath'], record['sides'])
-        command = ['lp', '-d', record['queue'], '-n', str(record['copies']), '-o', 'sides=' + record['sides'], print_path]
-        result = cmd(*command, timeout=35)
+        result = send_to_queue(record['queue'], str(record['copies']), record['sides'], print_path)
     except Exception as exc:
         with store.connection() as db:
             db.execute('UPDATE jobs SET status=?,error=? WHERE id=?', ('error', str(exc)[:400], job_id))
