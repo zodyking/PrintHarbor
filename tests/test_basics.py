@@ -574,15 +574,18 @@ class CoreTests(unittest.TestCase):
             self.assertEqual(denied.status_code,303)
             self.assertIn('/login', denied.headers['location'])
             client.post('/login', data={'username':'admin','password':os.environ['ADMIN_PASSWORD']}, follow_redirects=False)
+            with store.connection() as db:
+                db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol) VALUES('UnsetTail','Office Printer','192.0.2.77','socket')")
             first=client.get('/')
-            self.assertIn('No tailnet address', first.text)
+            self.assertIn('Office Printer is not set up', first.text)
+            self.assertNotIn('No tailnet address', first.text)
             self.assertIn('Dismiss Tailscale notice', first.text)
             token=re.search(r'name="token" value="([^"]+)"', first.text).group(1)
             closed=client.post('/tailscale/dismiss', data={'token':token,'page':'printers'}, follow_redirects=False)
             self.assertEqual(closed.status_code,303)
             self.assertIn('page=printers', closed.headers['location'])
             again=client.get('/?page=printers')
-            self.assertNotIn('No tailnet address', again.text)
+            self.assertNotIn('no Tailscale device', again.text)
             self.assertNotIn('Dismiss Tailscale notice', again.text)
             other=client.get('/')
             self.assertNotIn('Dismiss Tailscale notice', other.text)
@@ -596,6 +599,77 @@ class CoreTests(unittest.TestCase):
                 connected=client.get('/')
             self.assertIn('100.64.0.8', connected.text)
             self.assertNotIn('Dismiss Tailscale notice', connected.text)
+            self.assertNotIn('No tailnet address', connected.text)
+
+    def test_tailscale_notice_follows_each_printer(self):
+        missing = tailnet.notice(
+            [{'label': 'Office Printer', 'tail': {'online': False, 'hostname': ''}}],
+            {'online': False, 'state': 'Not connected', 'ip': '', 'hostname': ''},
+        )
+        self.assertEqual(missing['title'], 'Office Printer is not set up')
+        self.assertEqual(missing['detail'], 'This printer has no Tailscale device')
+        joined = tailnet.notice(
+            [{'label': 'Office Printer', 'tail': {'online': False, 'hostname': 'apt1-office-printer', 'ip': '100.120.57.53'}}],
+            {'online': False, 'ip': '', 'hostname': ''},
+        )
+        self.assertIsNone(joined)
+        running = tailnet.notice(
+            [{'label': 'Office Printer', 'tail': {'online': True, 'hostname': 'apt1-office-printer', 'ip': '100.120.57.53'}}],
+            {'online': True, 'hostname': 'apt1-office-printer', 'ip': '100.120.57.53', 'state': 'Connected'},
+        )
+        self.assertEqual(running['detail'], '100.120.57.53')
+        self.assertNotIn('No tailnet', running['title'] + running['detail'])
+
+    def test_supply_query_uses_the_printer_device(self):
+        reply = self._snmp_reply([(brother.OID_SERIAL, b'E12345')])
+        with patch('app.tailnet.udp_exchange', return_value=reply) as sent:
+            values = brother.snmp_get('192.0.2.40', [brother.OID_SERIAL])
+        self.assertEqual(sent.call_args.args[:2], ('192.0.2.40', 161))
+        self.assertEqual(values[brother.OID_SERIAL], b'E12345')
+        with patch('app.tailnet.udp_exchange', side_effect=tailnet.TailscaleError('down')), patch('app.brother.socket.socket') as raw:
+            self.assertIsNone(brother.snmp_get('192.0.2.40', [brother.OID_SERIAL]))
+        raw.assert_not_called()
+
+    def test_udp_exchange_speaks_socks5(self):
+        import time
+        tcp = socket.socket()
+        tcp.bind(('127.0.0.1', 0))
+        tcp.listen(1)
+        tcp.settimeout(3)
+        relay = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+        relay.bind(('127.0.0.1', 0))
+        relay.settimeout(3)
+        relay_port = relay.getsockname()[1]
+        seen = {}
+
+        def serve():
+            conn, _addr = tcp.accept()
+            conn.settimeout(3)
+            conn.recv(8)
+            conn.sendall(b'\x05\x00')
+            request = conn.recv(16)
+            seen['command'] = request[1]
+            conn.sendall(b'\x05\x00\x00\x01' + socket.inet_aton('127.0.0.1') + relay_port.to_bytes(2, 'big'))
+            packet, addr = relay.recvfrom(65535)
+            seen['packet'] = packet
+            body = packet[10:]
+            relay.sendto(b'\x00\x00\x00\x01' + socket.inet_aton('192.0.2.88') + (161).to_bytes(2, 'big') + b'pong:' + body, addr)
+            time.sleep(0.2)
+            conn.close()
+
+        threading.Thread(target=serve, daemon=True).start()
+        with store.connection() as db:
+            db.execute("INSERT OR REPLACE INTO printers(queue,label,host,protocol,tail_hostname) VALUES('UdpQ','UDP','192.0.2.88','socket','udp-printer')")
+        tailnet.assign_proxy('UdpQ', tcp.getsockname()[1])
+        try:
+            payload = tailnet.udp_exchange('192.0.2.88', 161, b'ping', 2)
+        finally:
+            tcp.close()
+            relay.close()
+        self.assertEqual(seen.get('command'), 3)
+        self.assertTrue(seen.get('packet', b'').endswith(b'ping'))
+        self.assertEqual(payload, b'pong:ping')
+        self.assertIsNone(tailnet.udp_exchange('203.0.113.9', 161, b'ping', 1))
 
     def test_unauthenticated_actions_redirect(self):
         from fastapi.testclient import TestClient
