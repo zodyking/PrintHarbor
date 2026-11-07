@@ -26,7 +26,7 @@ SIDES = {'one-sided', 'two-sided-long-edge', 'two-sided-short-edge'}
 QUEUE_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]{0,40}$')
 MODEL_RE = re.compile(r'^[A-Za-z0-9_.:/-]{1,180}$')
 OPTION_RE = re.compile(r'^[A-Za-z][A-Za-z0-9_-]{0,40}$')
-OPTION_VALUE_RE = re.compile(r'^[A-Za-z0-9_+-]{1,20}$')
+OPTION_VALUE_RE = re.compile(r'^[A-Za-z0-9_.:/+-]{1,64}$')
 
 class PrintError(Exception):
     pass
@@ -303,17 +303,42 @@ def pjl_identity(host):
     match = re.search(r'"([^"]{3,80})"', text)
     return match.group(1).strip()[:120] if match else ''
 
+def _identity_text(raw):
+    if isinstance(raw, bytes):
+        text = raw.decode('utf-8', 'replace')
+    else:
+        text = str(raw or '')
+    text = text.strip().strip('"')
+    if text.upper().startswith('MDL:'):
+        text = text.split(':', 1)[1].strip()
+    low = text.lower()
+    if not text or 'nosuch' in low or 'no such' in low:
+        return ''
+    return text[:120]
+
 def snmp_identity(host):
+    """The printer's own name. A joined printer is asked through its device."""
+    oids = ('1.3.6.1.2.1.25.3.2.1.3.1', '1.3.6.1.2.1.1.1.0', brother.OID_MODEL)
+    try:
+        values = brother.snmp_get(host, list(oids), timeout=1.5) or {}
+    except Exception:
+        values = {}
+    for oid in oids:
+        text = _identity_text(values.get(oid))
+        if text:
+            return text
+    if tailnet.proxy_for(host):
+        return ''
     community = os.getenv('SNMP_COMMUNITY', 'public')
     if not community or not shutil.which('snmpget'):
         return ''
-    for oid in ('1.3.6.1.2.1.25.3.2.1.3.1', '1.3.6.1.2.1.1.1.0'):
+    for oid in oids[:2]:
         result = cmd('snmpget', '-v2c', '-c', community, '-t', '1', '-r', '0', '-Oqv', host, oid, timeout=4)
         if result.returncode:
             continue
-        text = (result.stdout or '').strip().strip('"')
-        if text and 'nosuch' not in text.lower() and 'no such' not in text.lower():
-            return text[:120]
+        text = _identity_text(result.stdout)
+        if text:
+            return text
     return ''
 
 def discover_printer(host):
@@ -348,35 +373,66 @@ def discover_printer(host):
         found['model'] = found['identity']
     if not found['identity']:
         found['identity'] = ' '.join(part for part in (found['make'], found['model']) if part)[:120]
+    if _compact_name(found['identity']) in ('', 'printer', 'unknown'):
+        named = ' '.join(
+            part for part in (found['make'], found['model'])
+            if part and _compact_name(part) not in ('', 'printer', 'unknown')
+        )
+        if named:
+            found['identity'] = named[:120]
+    elif found['model'] and _compact_name(found['model']) not in ('', 'printer', 'unknown'):
+        if _compact_name(found['model']) not in _compact_name(found['identity']):
+            found['identity'] = f"{found['identity']} {found['model']}".strip()[:120]
     return found
 
+def _compact_name(text):
+    return re.sub(r'[^a-z0-9]+', '', (text or '').lower())
+
+def _model_codes(text):
+    return re.findall(r'[a-z]*\d[a-z0-9]*', _norm(text))
+
+def _vendor_bias(driver):
+    blob = f"{driver.get('name') or ''} {driver.get('make-and-model') or ''}".lower()
+    if 'brlaser' in blob:
+        return 8
+    if 'gutenprint' in blob:
+        return 6
+    return 0
+
 def choose_driver(discovery, drivers):
-    """Match a discovered printer to an installed driver, or use the printer's own description."""
+    """Match a discovered printer to its model driver. Generic and sibling models do not qualify."""
     model = _norm(discovery.get('model'))
     make = _norm(discovery.get('make'))
     identity = _norm(discovery.get('identity'))
+    wanted = _model_codes(model or identity)
     best = None
     best_score = 0
     for driver in drivers or []:
         name = driver.get('name') or ''
-        if not MODEL_RE.fullmatch(name) or name == 'everywhere' or name.endswith('generic.ppd'):
+        low = name.lower()
+        if not MODEL_RE.fullmatch(name):
+            continue
+        if any(word in low for word in ('everywhere', 'generic', 'driverless', 'drvless', 'foomatic')):
             continue
         fields = device_fields(driver.get('device-id'))
         described = _norm(fields.get('MDL') or driver.get('make-and-model') or '')
         maker = _norm(fields.get('MFG') or '')
+        if make and maker and make != maker:
+            continue
+        offered = _model_codes(described)
         score = 0
-        if model and described and (model == described or model in described or described in model):
+        if wanted and offered and wanted[0] == offered[0]:
             score = 100
+        elif model and described and (model == described or model in described or described in model):
+            if not wanted or not offered or wanted[0] == offered[0]:
+                score = 90
         elif identity and described and (identity in described or described in identity):
-            score = 85
-        else:
-            tokens = [tok for tok in (model or identity).split() if any(ch.isdigit() for ch in tok) or len(tok) >= 5]
-            if tokens and described:
-                overlap = sum(1 for tok in tokens if tok in described.split())
-                if overlap:
-                    score = 60 + (10 * overlap)
+            if not wanted or not offered or wanted[0] == offered[0]:
+                score = 85
         if score and make and maker and make == maker:
             score += 5
+        if score:
+            score += _vendor_bias(driver)
         if score > best_score:
             best = driver
             best_score = score
@@ -440,15 +496,142 @@ def driver_title(driver):
     title = (driver.get('make-and-model') or driver.get('name') or 'Driver').strip()
     return title[:120]
 
+def describe_driver(saved, protocol='', live=None):
+    """Name, package, and connection for the printer settings panel."""
+    text = (saved or '').strip()
+    live = live or {}
+    nickname = (live.get('nickname') or '').strip()
+    shown = nickname or text
+    _model, _, package = shown.partition(', using ')
+    name = shown
+    package = package.strip()
+    blob = f"{text} {nickname} {live.get('ppd') or ''}".lower()
+    if not package and 'brlaser' in blob:
+        package = 'brlaser'
+    elif not package and 'gutenprint' in blob:
+        package = 'Gutenprint'
+    elif not package and 'everywhere' in blob:
+        package = 'IPP Everywhere'
+    uri = live.get('uri') or ''
+    if uri.startswith('socket://') or protocol == 'socket':
+        connection = 'Port 9100'
+    elif uri.startswith('ipp://') or protocol == 'ipp':
+        connection = 'IPP'
+    else:
+        connection = ''
+    ppd = Path(live.get('ppd') or '').name
+    if not name:
+        name = 'Not selected yet'
+        package = ''
+    return {'name': name[:120], 'package': package[:80], 'connection': connection, 'ppd': ppd[:80]}
+
+def installed_driver(queue):
+    """The driver CUPS is actually using for this queue."""
+    blank = {'uri': '', 'ppd': '', 'nickname': ''}
+    if not QUEUE_RE.fullmatch(queue or ''):
+        return blank
+    try:
+        listed = cmd('lpstat', '-l', '-p', queue, timeout=6)
+    except PrintError:
+        return blank
+    info = dict(blank)
+    for line in (listed.stdout or '').splitlines():
+        stripped = line.strip()
+        lower = stripped.lower()
+        if lower.startswith('interface:'):
+            info['ppd'] = stripped.split(':', 1)[1].strip()
+        elif lower.startswith('device uri:'):
+            info['uri'] = stripped.split(':', 1)[1].strip()
+    path = info['ppd']
+    if path and Path(path).is_file():
+        try:
+            for raw in Path(path).read_text(errors='replace').splitlines():
+                if raw.startswith('*NickName:'):
+                    info['nickname'] = raw.split(':', 1)[1].strip().strip('"')[:120]
+                    break
+        except OSError:
+            pass
+    return info
+
+_PAPER_NAMES = {
+    'letter': 'Letter', 'naletter85x11in': 'Letter',
+    'legal': 'Legal', 'nalegal85x14in': 'Legal',
+    'tabloid': 'Tabloid', 'ledger': 'Tabloid',
+    'executive': 'Executive',
+    'a4': 'A4', 'a5': 'A5', 'a6': 'A6', 'isob5': 'B5',
+    'env10': 'No. 10 envelope', 'envc5': 'C5 envelope',
+    'envdl': 'DL envelope', 'envmonarch': 'Monarch envelope',
+    'fanfoldgermanlegal': 'German legal fanfold',
+}
+_PAPER_FIRST = ('Letter', 'Legal', 'Tabloid', 'Executive', 'A4', 'A5', 'A6', 'B5')
+_OPTION_NAMES = {
+    'pagesize': 'Paper size', 'mediasize': 'Paper size',
+    'mediasource': 'Paper source', 'inputslot': 'Paper source',
+    'mediatype': 'Paper type',
+    'duplex': 'Two-sided', 'sides': 'Two-sided',
+    'cupsprintquality': 'Print quality', 'printquality': 'Print quality',
+    'resolution': 'Resolution',
+}
+
+def _compact(text):
+    return re.sub(r'[^a-z0-9]+', '', (text or '').lower())
+
+def choice_label(value):
+    """The name a person uses, such as Letter for standard computer paper."""
+    text = str(value or '').strip()
+    named = _PAPER_NAMES.get(_compact(text))
+    if named:
+        return named
+    if text == 'True':
+        return 'On'
+    if text == 'False':
+        return 'Off'
+    return text
+
+def option_label(key, label):
+    raw = (label or key or '').strip()
+    named = _OPTION_NAMES.get(_compact(raw)) or _OPTION_NAMES.get(_compact(key))
+    if named:
+        return named
+    if raw and raw != key:
+        return raw[:60]
+    spaced = re.sub(r'(?<=[a-z])(?=[A-Z])', ' ', key or '')
+    spaced = re.sub(r'(?i)^cups', '', spaced).strip()
+    return (spaced or key or 'Setting')[:60]
+
+def _paper_setting(key, label):
+    compact = _compact(f'{key} {label}')
+    return 'pagesize' in compact or 'mediasize' in compact or 'papersize' in compact
+
+def _order_choices(values, current, paper):
+    by_label = {}
+    order = []
+    for value in values:
+        label = choice_label(value)
+        previous = by_label.get(label)
+        if previous is None:
+            by_label[label] = value
+            order.append(label)
+            continue
+        if value == current or value == label:
+            by_label[label] = value
+    ordered = [by_label[label] for label in order]
+    if not paper:
+        return ordered
+    first = [value for value in ordered if choice_label(value) in _PAPER_FIRST]
+    first.sort(key=lambda value: _PAPER_FIRST.index(choice_label(value)))
+    rest = [value for value in ordered if value not in first]
+    return first + rest
+
 def parse_queue_options(text):
-    """Choices advertised by a queue. The starred value is the one in use."""
+    """Every choice the driver reports. The starred value is the one in use."""
     options = []
     for line in (text or '').splitlines():
         if ':' not in line:
             continue
         left, _, right = line.partition(':')
         key = left.split('/', 1)[0].strip()
-        label = left.split('/', 1)[1].strip() if '/' in left else key
+        raw_label = left.split('/', 1)[1].strip() if '/' in left else key
         if not OPTION_RE.fullmatch(key):
             continue
         current = ''
@@ -463,21 +646,28 @@ def parse_queue_options(text):
                 current = value
         if len(values) < 2:
             continue
+        paper = _paper_setting(key, raw_label)
+        values = _order_choices(values, current or values[0], paper)
+        label = option_label(key, raw_label)
         options.append({
             'key': key,
-            'label': (label or key)[:60],
-            'values': values[:12],
+            'label': label,
+            'values': values,
+            'choices': [{'value': value, 'label': choice_label(value)} for value in values],
             'current': current or values[0],
+            'paper': paper,
         })
     def rank(option):
-        low = f"{option['key']} {option['label']}".lower()
-        if any(word in low for word in ('economode', 'toner save', 'density')):
+        if option.get('paper'):
             return 0
-        if any(word in low for word in ('resolution', 'duplex', 'sides', 'pagesize', 'media')):
+        low = f"{option['key']} {option['label']}".lower()
+        if any(word in low for word in ('economode', 'toner save', 'density', 'quality', 'resolution')):
             return 1
-        return 2
+        if any(word in low for word in ('duplex', 'two-sided', 'source', 'type')):
+            return 2
+        return 3
     options.sort(key=rank)
-    return options[:16]
+    return options
 
 def queue_options(queue):
     if not QUEUE_RE.fullmatch(queue or ''):
@@ -682,7 +872,7 @@ def retarget_saved_queues():
     except Exception:
         store.event('warning', 'Printer tailnet devices could not be resumed')
     with store.connection() as db:
-        rows = db.execute('SELECT queue, label, host, protocol FROM printers').fetchall()
+        rows = db.execute('SELECT queue, label, host, protocol, identity FROM printers').fetchall()
     if not rows:
         return
     try:
@@ -697,14 +887,28 @@ def retarget_saved_queues():
         try:
             address = _ipv4(row['host'])
             discovery = discover_printer(address)
-            if not discovery.get('reachable'):
-                store.event('warning', f'Printer {queue} did not answer, so its driver was left as-is')
+            remembered = (row['identity'] or '').strip()
+            if remembered and not discovery.get('model'):
+                discovery['identity'] = remembered
+                discovery['model'] = remembered
+                if not discovery.get('make'):
+                    low = remembered.lower()
+                    for brand in ('brother', 'epson', 'canon', 'lexmark', 'xerox', 'samsung'):
+                        if brand in low:
+                            discovery['make'] = brand.title()
+                            break
+                    if 'hp' in low or 'hewlett' in low:
+                        discovery['make'] = 'HP'
+            if not discovery.get('reachable') and not discovery.get('model'):
                 if tailnet.has_node(queue):
                     try:
                         use_tail_route(queue, address, row['protocol'] or 'socket')
                     except Exception:
                         pass
                 continue
+            if remembered and not discovery.get('socket') and not discovery.get('ipp'):
+                discovery['socket'] = (row['protocol'] or 'socket') != 'ipp'
+                discovery['ipp'] = (row['protocol'] or '') == 'ipp'
             choice = configure_queue(queue, address, discovery, drivers, keep_options=True)
         except Exception as exc:
             store.event('warning', f'Printer {queue} was not updated: {exc}'[:240])
@@ -1030,7 +1234,10 @@ def printer_block(queue):
     issues = printer_issues(stats, online=online)
     if not issues:
         return None
-    return {'issues': issues, 'label': label, 'identity': identity}
+    reported = ' '.join(
+        part for part in (identity, (stats or {}).get('model') or '', (stats or {}).get('device_id') or '') if part
+    )
+    return {'issues': issues, 'label': label, 'identity': reported}
 
 
 def waiting_text(issues):
@@ -1538,6 +1745,33 @@ def readings_from_snmp(lines):
         supplies.append({'name': name[:40], 'percent': percent})
     return {'state': state, 'reasons': [], 'pages': pages, 'supplies': supplies[:6], 'serial': serial, 'firmware': ''}
 
+def _is_drum(name):
+    low = str(name or '').lower()
+    return any(word in low for word in ('drum', 'opc', 'imaging', 'photoconductor'))
+
+def _is_toner(name):
+    low = str(name or '').lower()
+    return ('toner' in low or 'ink' in low) and 'waste' not in low and not _is_drum(low)
+
+def _merge_supplies(*groups):
+    """Keep one toner and one drum. A drum-only reply must not hide the toner from another."""
+    chosen = []
+    seen = set()
+    for group in groups:
+        for item in group or []:
+            name = str(item.get('name') or '')
+            if _is_drum(name):
+                key = 'drum'
+            elif _is_toner(name):
+                key = 'toner'
+            else:
+                key = name.lower()
+            if not key or key in seen or item.get('percent') is None:
+                continue
+            seen.add(key)
+            chosen.append(item)
+    return chosen[:6]
+
 def condition(stats, online=False):
     """Toner, drum, paper, and jam as separate readings. Unknown when the printer did not say."""
     blank = {'toner': None, 'drum': None, 'paper': 'unknown', 'jam': 'unknown', 'mark': 'Toner', 'note': ''}
@@ -1549,7 +1783,7 @@ def condition(stats, online=False):
     for item in stats.get('supplies') or []:
         name = str(item.get('name') or '')
         low = name.lower()
-        if any(word in low for word in ('drum', 'opc', 'imaging', 'photoconductor')):
+        if _is_drum(low):
             if drum is None:
                 drum = item
             continue
@@ -1578,14 +1812,23 @@ def condition(stats, online=False):
 def printer_stats(host, identity=''):
     """Live snapshot. Empty when the printer does not answer IPP or SNMP."""
     try:
-        ipp = readings_from_ipp(ipp_attributes(host))
+        attrs = ipp_attributes(host)
+        ipp = readings_from_ipp(attrs)
         snmp = readings_from_snmp(_snmp_lines(host))
     except Exception:
         return None
+    hint = ' '.join([
+        identity or '',
+        str((attrs.get('printer-make-and-model') or [''])[0]),
+        str((attrs.get('printer-device-id') or [''])[0]),
+    ])
+    reported = (ipp.get('supplies') or []) + (snmp.get('supplies') or [])
+    has_toner = any(_is_toner(item.get('name')) for item in reported)
+    has_drum = any(_is_drum(item.get('name')) for item in reported)
     extra = None
-    if brother.looks_like_brother(identity):
+    if brother.looks_like_brother(hint) or (has_drum and not has_toner):
         try:
-            extra = brother.readings(host, identity)
+            extra = brother.readings(host, hint)
         except Exception:
             extra = None
     pages = snmp['pages']
@@ -1595,17 +1838,29 @@ def printer_stats(host, identity=''):
     for item in (extra or {}).get('reasons') or []:
         if item not in reasons:
             reasons.append(item)
+    fields = device_fields((attrs.get('printer-device-id') or [''])[0])
+    device_id = str((attrs.get('printer-device-id') or [''])[0] or '')[:300]
+    reported = ' '.join(part for part in (fields.get('MFG'), fields.get('MDL')) if part).strip()
+    make_model = str((attrs.get('printer-make-and-model') or [''])[0] or '').strip()
+    if _compact_name(make_model) in ('', 'printer', 'unknown'):
+        model = reported
+    elif reported and _compact_name(fields.get('MDL') or '') not in _compact_name(make_model):
+        model = f'{make_model} {reported}'.strip()
+    else:
+        model = make_model or reported
     stats = {
         'state': ipp['state'] or snmp['state'] or ((extra or {}).get('state') or ''),
         'reasons': reasons,
         'pages': pages,
         'pages_label': f'{pages:,}' if isinstance(pages, int) else '',
-        'supplies': ((extra or {}).get('supplies') or ipp['supplies'] or snmp['supplies']),
+        'supplies': _merge_supplies((extra or {}).get('supplies'), snmp['supplies'], ipp['supplies']),
         'serial': ipp['serial'] or snmp['serial'] or ((extra or {}).get('serial') or ''),
         'firmware': ipp['firmware'],
         'checks': (extra or {}).get('checks') or [],
+        'model': model[:120],
+        'device_id': device_id,
     }
-    if not any((stats['state'], stats['pages_label'], stats['supplies'], stats['serial'], stats['firmware'], stats['reasons'], stats['checks'])):
+    if not any((stats['state'], stats['pages_label'], stats['supplies'], stats['serial'], stats['firmware'], stats['reasons'], stats['checks'], stats['model'])):
         return None
     return stats
 

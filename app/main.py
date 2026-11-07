@@ -129,10 +129,15 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
                 printer['host'], printer['protocol'], printer.get('identity') or printer.get('label') or '',
             )
             printer['condition'] = printing.condition(printer['stats'], printer['online'])
-            printer['supply'] = supplies.replacement_for(printer.get('identity') or printer.get('label') or '')
+            printer['supply'] = supplies.from_printer(printer)
             printer['image'] = images.describe(printer)
             if page == 'printers':
                 printer['options'] = printing.queue_options(printer['queue'])
+                printer['driver_info'] = printing.describe_driver(
+                    printer.get('driver') or '',
+                    printer.get('protocol') or '',
+                    printing.installed_driver(printer['queue']),
+                )
     jobs = store.records('jobs', 100) if page in ('overview', 'jobs') else []
     counts = {
         'total': len(jobs),

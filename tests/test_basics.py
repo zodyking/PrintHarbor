@@ -229,6 +229,19 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(described['model'],'everywhere')
         self.assertEqual(described['protocol'],'ipp')
         self.assertNotIn('generic.ppd', described['model'])
+        sibling=printing.choose_driver({
+            'reachable':True,'ipp':True,'socket':True,'make':'Brother',
+            'model':'HL-L2380DW series','identity':'Brother HL-L2380DW series',
+        }, [{
+            'name':'gutenprint.5.3://brother/hl-l2350dw',
+            'make-and-model':'Brother HL-L2350DW',
+            'device-id':'MFG:Brother;MDL:HL-L2350DW;',
+        }])
+        self.assertEqual(sibling['model'],'everywhere')
+        facts=printing.describe_driver('Brother HL-L2380DW series, using brlaser v6.2.8', 'socket')
+        self.assertEqual(facts['name'],'Brother HL-L2380DW series, using brlaser v6.2.8')
+        self.assertEqual(facts['package'],'brlaser v6.2.8')
+        self.assertEqual(facts['connection'],'Port 9100')
         fields=printing.device_fields('MFG:Brother;CMD:PJL;MDL:HL-L2380DW series;')
         self.assertEqual(fields['MFG'],'Brother')
         self.assertEqual(fields['MDL'],'HL-L2380DW series')
@@ -284,6 +297,23 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(ready['jam'],'clear')
         self.assertEqual(ready['drum']['percent'],80)
         self.assertEqual(ready['toner']['name'],'Black Toner Cartridge')
+        drum_only={
+            'printer-state':[3],
+            'marker-names':['Drum Unit'],
+            'marker-levels':[93],
+            'marker-high-levels':[100],
+            'printer-device-id':['MFG:Brother;MDL:HL-L2380DW series;SN:U63886K5N769589;'],
+        }
+        brother_supplies={'supplies':[{'name':'Black Toner','percent':64},{'name':'Drum','percent':93}],'pages':829,'serial':'U63886K5N769589','reasons':[],'checks':[]}
+        with patch.object(printing,'ipp_attributes',return_value=drum_only), patch.object(printing,'_snmp_lines',return_value=None), patch('app.brother.readings',return_value=brother_supplies) as asked:
+            filled=printing.printer_stats('192.168.0.105','Printer')
+        self.assertEqual(asked.call_count,1)
+        shown=printing.condition(filled, online=True)
+        self.assertEqual(shown['toner']['name'],'Black Toner')
+        self.assertEqual(shown['toner']['percent'],64)
+        self.assertEqual(shown['drum']['percent'],93)
+        self.assertEqual(filled['model'],'Brother HL-L2380DW series')
+        self.assertIn('MDL:HL-L2380DW', filled['device_id'])
         jammed=printing.condition({'reasons':['Paper jam','Out of paper'],'supplies':[{'name':'Black Ink','percent':12}]}, online=True)
         self.assertEqual(jammed['paper'],'empty')
         self.assertEqual(jammed['jam'],'jam')
@@ -316,6 +346,18 @@ class CoreTests(unittest.TestCase):
         self.assertEqual(ink['name'],'')
         self.assertIn('OfficeJet+Pro+9020+ink+cartridge', ink['url'])
         self.assertIsNone(supplies.replacement_for('  '))
+        self.assertIsNone(supplies.replacement_for('Printer'))
+        reported=supplies.replacement_for('Printer MFG:Brother;MDL:HL-L2380DW series;SN:U63886K5N769589;')
+        self.assertEqual(reported['name'],'TN660')
+        self.assertIn('TN660+toner+cartridge', reported['url'])
+        self.assertNotIn('Printer+printer', reported['url'])
+        named=supplies.from_printer({
+            'identity':'Printer',
+            'label':'Office Printer',
+            'driver':'IPP Everywhere',
+            'stats':{'model':'Brother HL-L2380DW series','device_id':'MFG:Brother;MDL:HL-L2380DW series;'},
+        })
+        self.assertEqual(named['name'],'TN660')
         with store.connection() as db:
             db.execute("INSERT OR IGNORE INTO printers(queue,label,host,protocol,identity) VALUES('TonerQ','Office Printer','192.0.2.41','socket','Brother HL-L2380DW series')")
         from fastapi.testclient import TestClient
@@ -324,10 +366,21 @@ class CoreTests(unittest.TestCase):
             with TestClient(app) as client:
                 client.post('/login',data={'username':'admin','password':os.environ['ADMIN_PASSWORD']},follow_redirects=False)
                 page=client.get('/?page=printers')
-        self.assertIn('Toner TN660', page.text)
-        self.assertIn('Lowest price on Amazon', page.text)
+        self.assertIn('class="supply-label"', page.text)
+        self.assertIn('>Toner</a>', page.text)
+        self.assertIn('title="Lowest price on Amazon"', page.text)
         self.assertIn('TN660+toner+cartridge', page.text)
+        self.assertNotIn('supply-link', page.text)
+        self.assertNotIn('>Cartridge<', page.text)
         self.assertIn('rel="noopener noreferrer"', page.text)
+        attrs={
+            'printer-make-and-model':['Printer'],
+            'printer-device-id':['MFG:Brother;MDL:HL-L2380DW series;SN:U63886K5N769589;'],
+        }
+        with patch.object(printing,'printer_reachable',return_value=True), patch.object(printing,'ipp_identity',return_value=attrs), patch.object(printing,'snmp_identity',return_value=''):
+            found=printing.discover_printer('192.0.2.105')
+        self.assertEqual(found['identity'],'Brother HL-L2380DW series')
+        self.assertEqual(found['model'],'HL-L2380DW series')
 
     def test_overview_shows_toner_level(self):
         with store.connection() as db:
@@ -430,6 +483,30 @@ class CoreTests(unittest.TestCase):
             db.execute("DELETE FROM printers WHERE queue='Kept'")
         self.assertEqual(row['protocol'],'ipp')
 
+    def test_known_model_keeps_its_driver_while_offline(self):
+        calls=[]
+        def fake_cmd(*args, timeout=25):
+            calls.append(args)
+            stdout=''
+            if args[0]=='lpinfo':
+                stdout='drv:///brlaser.drv/brl2380d.ppd Brother HL-L2380DW series, using brlaser v6.2.8\n'
+            elif args[:2]==('lpoptions','-p'):
+                stdout='brlaserDensityAdjust/Toner Density: *100 106\n'
+            return SimpleNamespace(returncode=0, stdout=stdout, stderr='')
+        with store.connection() as db:
+            db.execute("DELETE FROM printers WHERE queue='OfflineDrv'")
+            db.execute("INSERT INTO printers(queue,label,host,protocol,identity,driver) VALUES('OfflineDrv','Office','192.0.2.45','socket','Brother HL-L2380DW series','')")
+        try:
+            with patch.object(printing,'cmd',fake_cmd), patch.object(printing,'discover_printer',return_value={'reachable':False,'ipp':False,'socket':False,'make':'','model':'','identity':''}):
+                printing.retarget_saved_queues()
+            self.assertIn(('lpadmin','-p','OfflineDrv','-E','-v','socket://192.0.2.45:9100','-m','drv:///brlaser.drv/brl2380d.ppd'),calls)
+            with store.connection() as db:
+                notes=[row['message'] for row in db.execute("SELECT message FROM events").fetchall()]
+            self.assertFalse(any('left as-is' in note for note in notes))
+        finally:
+            with store.connection() as db:
+                db.execute("DELETE FROM printers WHERE queue='OfflineDrv'")
+
     def test_driver_settings_are_named_and_can_be_changed(self):
         listed='\n'.join([
             'brlaserEconomode/Toner save mode: *True False',
@@ -437,10 +514,21 @@ class CoreTests(unittest.TestCase):
             'PageSize/Media Size: Letter *A4',
         ])
         parsed=printing.parse_queue_options(listed)
-        self.assertEqual(parsed[0]['key'],'brlaserEconomode')
-        self.assertEqual(parsed[0]['current'],'True')
-        self.assertEqual(parsed[1]['label'],'Toner Density')
-        self.assertEqual([item['current'] for item in parsed if item['key']=='brlaserDensityAdjust'],['102'])
+        by_key={item['key']: item for item in parsed}
+        self.assertEqual(by_key['PageSize']['label'],'Paper size')
+        self.assertEqual(by_key['PageSize']['choices'][0]['label'],'Letter')
+        self.assertEqual(by_key['brlaserEconomode']['current'],'True')
+        self.assertEqual(by_key['brlaserDensityAdjust']['label'],'Toner Density')
+        self.assertEqual(by_key['brlaserDensityAdjust']['current'],'102')
+        sizes=' '.join(['3x5','A4','A5','A6','Env10','EnvC5','EnvDL','EnvMonarch','Executive','FanFoldGermanLegal','ISOB5','Legal','*Letter','Tabloid','na_letter_8.5x11in'])
+        wide=printing.parse_queue_options('PageSize/Media Size: '+sizes+'\ncupsPrintQuality/cupsPrintQuality: *Normal High\n')
+        paper=next(item for item in wide if item['key']=='PageSize')
+        self.assertEqual(paper['label'],'Paper size')
+        self.assertEqual(paper['current'],'Letter')
+        self.assertEqual(paper['choices'][0],{'value':'Letter','label':'Letter'})
+        self.assertGreater(len(paper['values']),12)
+        self.assertEqual(sum(1 for choice in paper['choices'] if choice['label']=='Letter'),1)
+        self.assertEqual(next(item for item in wide if item['key']=='cupsPrintQuality')['label'],'Print quality')
         calls=[]
         def fake_cmd(*args, timeout=25):
             calls.append(args)
@@ -475,6 +563,8 @@ class CoreTests(unittest.TestCase):
                 page=client.get('/?page=printers')
                 self.assertIn('Brother HL-L2380DW series, using brlaser v6.2.8', page.text)
                 self.assertIn('Driver settings', page.text)
+                self.assertIn('Paper size', page.text)
+                self.assertIn('>Letter<', page.text)
                 self.assertIn('name="opt_brlaserDensityAdjust"', page.text)
                 self.assertIn('Toner save mode', page.text)
                 token=re.search(r'name="token" value="([^"]+)"', page.text).group(1)
