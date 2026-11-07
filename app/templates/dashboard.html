@@ -20,14 +20,11 @@
 <div class="station">
   <div class="station-visual">
     <img class="printer-photo" src="/printer-images/{{ p.queue }}" alt="{{ p.label }}" width="260" height="180" {% if p.image.pending %}data-pending="1"{% endif %}>
-    <p class="image-caption">{{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% endif %}</p>
-    {% if p.image.attribution %}
-    <p class="image-caption">{% if p.image.page %}<a href="{{ p.image.page }}" target="_blank" rel="noopener noreferrer">{{ p.image.attribution }}</a>{% else %}{{ p.image.attribution }}{% endif %}{% if p.image.license %} · {{ p.image.license }}{% endif %}</p>
-    {% endif %}
   </div>
   <dl class="readout">
     <div class="read">
-      <dt>{{ toner.name if toner else (c.mark if c else 'Toner') }}</dt>
+      {% set toner_label = toner.name if toner else (c.mark if c else 'Toner') %}
+      <dt>{% if p.supply %}<a class="supply-label" href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer" title="Lowest price on Amazon">{{ toner_label }}</a>{% else %}{{ toner_label }}{% endif %}</dt>
       <dd>
         {% if toner %}
         <strong>{{ toner.percent }}%</strong>
@@ -100,7 +97,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/style.css?v=19">
+  <link rel="stylesheet" href="/static/style.css?v=23">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
@@ -148,7 +145,6 @@
             <span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Online' if p.online else 'Offline') }}</span>
           </div>
           {{ printer_station(p) }}
-          {% if p.supply %}<a class="textlink station-supply" href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer">{{ p.supply.kind }}{% if p.supply.name %} {{ p.supply.name }}{% endif %}</a>{% endif %}
         </article>
         {% endfor %}
       </section>
@@ -205,23 +201,31 @@
             {% for p in printers %}
             {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
             <div class="printer-block">
-              <div class="printer-line expand"><img class="printer-thumb" src="/printer-images/{{ p.queue }}" alt="" width="44" height="44" {% if p.image.pending %}data-pending="1"{% endif %}><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}</small><small>{{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% endif %}</small><small>{% if p.tail.online %}Tailnet device{% if p.tail.hostname %} {{ p.tail.hostname }}{% endif %}{% if p.tail.ip %} · {{ p.tail.ip }}{% endif %}{% elif p.tail.hostname %}Tailnet device {{ p.tail.hostname }} · signed out{% else %}{{ p.label }} is not set up on Tailscale{% endif %}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
+              <div class="printer-line expand"><img class="printer-thumb" src="/printer-images/{{ p.queue }}" alt="" width="44" height="44" {% if p.image.pending %}data-pending="1"{% endif %}><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{% if p.tail.online %}Tailnet device{% if p.tail.hostname %} {{ p.tail.hostname }}{% endif %}{% if p.tail.ip %} · {{ p.tail.ip }}{% endif %}{% elif p.tail.hostname %}Tailnet device {{ p.tail.hostname }} · signed out{% else %}{{ p.label }} is not set up on Tailscale{% endif %}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
               {{ printer_station(p) }}
               {% if p.online and p.stats and (p.stats.pages_label or p.stats.serial or p.stats.firmware) %}
               <p class="station-facts">{% if p.stats.pages_label %}<span>Pages <strong>{{ p.stats.pages_label }}</strong></span>{% endif %}{% if p.stats.serial %}<span>Serial <strong>{{ p.stats.serial }}</strong></span>{% endif %}{% if p.stats.firmware %}<span>Firmware <strong>{{ p.stats.firmware }}</strong></span>{% endif %}</p>
               {% endif %}
+              <div class="driver-settings">
+                <div class="panelhead"><div><h3>Driver settings</h3><p>Paper size and every other setting this driver reports.</p></div></div>
+                <dl class="readout driver-facts">
+                  <div class="read"><dt>Driver</dt><dd><strong>{{ p.driver_info.name }}</strong></dd></div>
+                  {% if p.driver_info.package %}<div class="read"><dt>Package</dt><dd><strong>{{ p.driver_info.package }}</strong></dd></div>{% endif %}
+                  {% if p.driver_info.connection %}<div class="read"><dt>Connection</dt><dd><strong>{{ p.driver_info.connection }}</strong></dd></div>{% endif %}
+                  {% if p.driver_info.ppd %}<div class="read"><dt>PPD</dt><dd><strong>{{ p.driver_info.ppd }}</strong></dd></div>{% endif %}
+                </dl>
               {% if p.options %}
-              <form class="form-stack driver-settings" method="post" action="/printers/options">
+              <form class="form-stack" method="post" action="/printers/options">
                 <input type="hidden" name="token" value="{{ token }}">
                 <input type="hidden" name="queue" value="{{ p.queue }}">
                 <fieldset>
-                  <legend>Driver settings</legend>
-                  <div class="form-row">
+                  <legend class="visually-hidden">Driver options</legend>
+                  <div class="option-grid">
                     {% for opt in p.options %}
-                    <label>{{ opt.label }}
+                    <label class="{{ 'span-2' if opt.paper else '' }}">{{ opt.label }}
                       <select name="opt_{{ opt.key }}">
-                        {% for value in opt['values'] %}
-                        <option value="{{ value }}" {% if value == opt.current %}selected{% endif %}>{{ 'On' if value == 'True' else ('Off' if value == 'False' else value) }}</option>
+                        {% for choice in opt.choices %}
+                        <option value="{{ choice.value }}" {% if choice.value == opt.current %}selected{% endif %}>{{ choice.label }}</option>
                         {% endfor %}
                       </select>
                     </label>
@@ -231,6 +235,7 @@
                 <button class="button subtle" type="submit">Save settings</button>
               </form>
               {% endif %}
+              </div>
               <details class="image-change">
                 <summary>Tailscale device</summary>
                 {{ tail_form(p, 'printers') }}
@@ -279,13 +284,6 @@
                   </div>
                 </form>
               </details>
-              {% if p.supply %}
-              <div class="supply-link">
-                <span>{{ p.supply.kind }}{% if p.supply.name %} {{ p.supply.name }}{% endif %}</span>
-                <a href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer">Lowest price on Amazon</a>
-                {% if p.supply.note %}<small>{{ p.supply.note }}</small>{% endif %}
-              </div>
-              {% endif %}
             </div>
             {% endfor %}
           </div>
