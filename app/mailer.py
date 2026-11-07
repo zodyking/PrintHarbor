@@ -3,8 +3,9 @@ import email
 import imaplib
 import re
 import secrets
-import select
 import smtplib
+import socket
+import ssl
 import threading
 import time
 from email import policy
@@ -24,6 +25,8 @@ SIDE_LABELS = {
 LAST = {'checked': None, 'state': 'Not configured', 'detail': ''}
 STOP = threading.Event()
 _LOCK = threading.Lock()
+_DROPS = []
+_DROP_WARNED = False
 
 def publish(**kwargs):
     with _LOCK:
@@ -669,26 +672,38 @@ def supports_idle(conn):
     blob = b' '.join(item if isinstance(item, bytes) else str(item).encode() for item in (data or []))
     return b'IDLE' in blob.upper()
 
-def wait_for_new_mail(conn, seconds=30):
+def _set_timeout(conn, seconds):
+    try:
+        conn.sock.settimeout(seconds)
+    except Exception:
+        pass
+
+def _read_paused(exc):
+    if isinstance(exc, (TimeoutError, socket.timeout)):
+        return True
+    return 'timed out' in str(exc).lower()
+
+def wait_for_new_mail(conn, seconds=240):
+    """Watch with IDLE. A quiet timeout is normal and does not drop the connection."""
     tag = conn._new_tag()
     if isinstance(tag, str):
         tag = tag.encode()
     conn.send(tag + b' IDLE\r\n')
+    _set_timeout(conn, 20)
     reply = conn.readline()
-    if not reply.startswith(b'+'):
+    if not reply or not reply.startswith(b'+'):
         raise RuntimeError('Mailbox cannot watch for new mail')
     changed = False
     try:
         deadline = time.monotonic() + seconds
         while not STOP.is_set() and time.monotonic() < deadline:
-            remaining = max(0, deadline - time.monotonic())
+            _set_timeout(conn, max(0.2, min(1, deadline - time.monotonic())))
             try:
-                readable, _, _ = select.select([conn.sock], [], [], min(1, remaining))
-            except (OSError, ValueError) as exc:
-                raise RuntimeError('Mailbox watch stopped') from exc
-            if not readable:
-                continue
-            line = conn.readline()
+                line = conn.readline()
+            except (TimeoutError, socket.timeout, ssl.SSLError, OSError) as exc:
+                if _read_paused(exc):
+                    continue
+                raise
             if not line:
                 raise RuntimeError('Mailbox connection closed')
             upper = line.upper()
@@ -698,10 +713,7 @@ def wait_for_new_mail(conn, seconds=30):
             if b'BYE' in upper:
                 raise RuntimeError('Mailbox connection closed')
     finally:
-        try:
-            conn.sock.settimeout(3)
-        except Exception:
-            pass
+        _set_timeout(conn, 8)
         try:
             conn.send(b'DONE\r\n')
             while True:
@@ -710,10 +722,7 @@ def wait_for_new_mail(conn, seconds=30):
                     break
         except Exception:
             pass
-        try:
-            conn.sock.settimeout(None)
-        except Exception:
-            pass
+        _set_timeout(conn, 30)
     return changed
 
 def take_new(conn, config, folder):
@@ -766,6 +775,33 @@ def take_new(conn, config, folder):
     publish(state=state, detail=detail)
     return len(pending) >= 35
 
+def _transient_mail(detail):
+    low = str(detail or '').lower()
+    return any(phrase in low for phrase in (
+        'timed out', 'timeout', 'connection closed', 'connection reset', 'broken pipe',
+        'socket error', 'eof', 'mailbox watch stopped', 'cannot read from timed out',
+        'temporarily unavailable',
+    ))
+
+def note_mail_drop(detail):
+    """A dropped IDLE connection is normal. Reconnect quietly, and warn only when it keeps happening."""
+    global _DROP_WARNED
+    _ = detail
+    now = time.monotonic()
+    _DROPS[:] = [item for item in _DROPS if now - item < 1800]
+    _DROPS.append(now)
+    if len(_DROPS) >= 4 and not _DROP_WARNED:
+        _DROP_WARNED = True
+        store.event('warning', 'The mailbox connection keeps dropping. PrintHarbor is reconnecting.')
+    if len(_DROPS) < 4:
+        _DROP_WARNED = False
+    publish(state='Watching', detail='Reconnecting to the mailbox.')
+
+def note_mail_ok():
+    global _DROP_WARNED
+    _DROPS.clear()
+    _DROP_WARNED = False
+
 def _scrub(exc):
     secret = ''
     try:
@@ -782,16 +818,20 @@ def check_once():
         if not ready(config):
             return
         folder = config.get('imap_folder') or 'INBOX'
-        conn = imaplib.IMAP4_SSL(config['imap_host'], int(config.get('imap_port', '993')), timeout=18)
+        conn = imaplib.IMAP4_SSL(config['imap_host'], int(config.get('imap_port', '993')), timeout=30)
         conn.login(config['imap_user'], config['imap_password'])
         status, _ = conn.select(folder)
         if status != 'OK':
             raise RuntimeError('Cannot select IMAP folder')
+        note_mail_ok()
         take_new(conn, config, folder)
     except Exception as exc:
         detail = _scrub(exc)
-        publish(state='Error', detail=detail[:170])
-        store.event('error', 'Mail check failed: ' + detail[:300])
+        if _transient_mail(detail):
+            note_mail_drop(detail)
+        else:
+            publish(state='Error', detail=detail[:170])
+            store.event('error', 'Mail check failed: ' + detail[:300])
     finally:
         publish(checked=time.strftime('%Y-%m-%d %H:%M:%S'))
         if conn:
@@ -810,11 +850,12 @@ def run_loop():
                 continue
             folder = (config.get('imap_folder') or 'INBOX').strip() or 'INBOX'
             identity = mailbox_identity(config)
-            conn = imaplib.IMAP4_SSL(config['imap_host'], int(config.get('imap_port', '993')), timeout=18)
+            conn = imaplib.IMAP4_SSL(config['imap_host'], int(config.get('imap_port', '993')), timeout=30)
             conn.login(config['imap_user'], config['imap_password'])
             status, _ = conn.select(folder)
             if status != 'OK':
                 raise RuntimeError('Cannot select IMAP folder')
+            note_mail_ok()
             idle = supports_idle(conn)
             while not STOP.is_set():
                 fresh = store.settings()
@@ -828,9 +869,12 @@ def run_loop():
                     break
         except Exception as exc:
             detail = _scrub(exc)
-            publish(state='Error', detail=detail[:170])
-            store.event('error', 'Mail check failed: ' + detail[:300])
-            STOP.wait(3)
+            if _transient_mail(detail):
+                note_mail_drop(detail)
+            else:
+                publish(state='Error', detail=detail[:170])
+                store.event('error', 'Mail check failed: ' + detail[:300])
+            STOP.wait(5)
         finally:
             publish(checked=time.strftime('%Y-%m-%d %H:%M:%S'))
             if conn:
