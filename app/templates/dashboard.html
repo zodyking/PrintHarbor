@@ -71,7 +71,7 @@
   {% elif p.tail.hostname %}
   <p class="form-help">{{ p.tail.hostname }} is signed out.</p>
   {% else %}
-  <p class="form-help">This printer is not a tailnet device yet.</p>
+  <p class="form-help">{{ p.label }} is not set up on Tailscale.</p>
   {% endif %}
   {% if p.tail.hostname or p.tail.online %}
   <form method="post" action="/printers/tailscale" class="form-stack" onsubmit="return confirm('Remove {{ p.label }} from the tailnet?')">
@@ -118,12 +118,12 @@
     </ul>
   </nav>
   <div class="sidebar-bottom">
-    {% if tail.online %}
-    <a class="tail-info" href="/?page=tailscale"><span class="green-dot"></span><div><strong>Tailscale {{ tail.state }}</strong><small>{{ tail.ip or "No tailnet address" }}</small></div></a>
-    {% elif not tail_dismissed %}
+    {% if tail_note and tail_note.kind == 'online' %}
+    <a class="tail-info" href="/?page=tailscale"><span class="green-dot"></span><div><strong>{{ tail_note.title }}</strong><small>{{ tail_note.detail }}</small></div></a>
+    {% elif tail_note and tail_note.kind == 'unset' and not tail_dismissed %}
     <div class="tail-info tail-pop" role="status">
       <span class="green-dot is-warn"></span>
-      <a href="/?page=tailscale"><strong>Tailscale {{ tail.state }}</strong><small>{{ tail.ip or "No tailnet address" }}</small></a>
+      <a href="/?page=tailscale"><strong>{{ tail_note.title }}</strong><small>{{ tail_note.detail }}</small></a>
       <form method="post" action="/tailscale/dismiss"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="page" value="{{ page }}"><button class="tail-close" type="submit" aria-label="Dismiss Tailscale notice">×</button></form>
     </div>
     {% endif %}
@@ -144,7 +144,7 @@
         {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
         <article class="station-card">
           <div class="station-head">
-            <div><h2>{{ p.label }}</h2><p>{{ p.identity or p.host }}{% if p.online and p.stats and p.stats.pages_label %} · {{ p.stats.pages_label }} pages{% endif %}</p></div>
+            <div><h2>{{ p.label }}</h2><p>{{ p.identity or p.host }}{% if p.online and p.stats and p.stats.pages_label %} · {{ p.stats.pages_label }} pages{% endif %}{% if p.tail.online %} · {{ p.tail.hostname or 'On the tailnet' }}{% if p.tail.ip %} · {{ p.tail.ip }}{% endif %}{% elif p.tail.hostname %} · {{ p.tail.hostname }} signed out{% else %} · {{ p.label }} is not set up on Tailscale{% endif %}</p></div>
             <span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Online' if p.online else 'Offline') }}</span>
           </div>
           {{ printer_station(p) }}
@@ -205,7 +205,7 @@
             {% for p in printers %}
             {% set live = p.stats.state if p.online and p.stats and p.stats.state else '' %}
             <div class="printer-block">
-              <div class="printer-line expand"><img class="printer-thumb" src="/printer-images/{{ p.queue }}" alt="" width="44" height="44" {% if p.image.pending %}data-pending="1"{% endif %}><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}</small><small>{{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% endif %}</small><small>{% if p.tail.online %}Tailnet device{% if p.tail.hostname %} {{ p.tail.hostname }}{% endif %}{% if p.tail.ip %} · {{ p.tail.ip }}{% endif %}{% elif p.tail.hostname %}Tailnet device {{ p.tail.hostname }} · signed out{% else %}Not a tailnet device{% endif %}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
+              <div class="printer-line expand"><img class="printer-thumb" src="/printer-images/{{ p.queue }}" alt="" width="44" height="44" {% if p.image.pending %}data-pending="1"{% endif %}><div class="grow"><strong>{{ p.label }}</strong><small>{{ p.identity or 'Printer' }} · {{ p.host }}</small><small>{{ p.driver or 'Driver selected when the printer answers' }}</small><small>{{ p.image.source_label }}{% if p.image.confident %} · Confident match{% elif p.image.pending %} · Looking up{% endif %}</small><small>{% if p.tail.online %}Tailnet device{% if p.tail.hostname %} {{ p.tail.hostname }}{% endif %}{% if p.tail.ip %} · {{ p.tail.ip }}{% endif %}{% elif p.tail.hostname %}Tailnet device {{ p.tail.hostname }} · signed out{% else %}{{ p.label }} is not set up on Tailscale{% endif %}</small></div><span class="status {% if not p.online %}offline{% elif live=='Stopped' %}warn{% else %}online{% endif %}">{{ live or ('Reachable' if p.online else 'Offline') }}</span><div class="printer-actions"><a class="text-button" href="/?page=printers&amp;edit={{ p.queue }}">Edit</a><form method="post" action="/printers/remove" onsubmit="return confirm('Delete printer {{ p.label }}?')"><input type="hidden" name="token" value="{{ token }}"><input type="hidden" name="queue" value="{{ p.queue }}"><button type="submit" class="text-danger" aria-label="Remove {{ p.label }}">Remove</button></form></div></div>
               {{ printer_station(p) }}
               {% if p.online and p.stats and (p.stats.pages_label or p.stats.serial or p.stats.firmware) %}
               <p class="station-facts">{% if p.stats.pages_label %}<span>Pages <strong>{{ p.stats.pages_label }}</strong></span>{% endif %}{% if p.stats.serial %}<span>Serial <strong>{{ p.stats.serial }}</strong></span>{% endif %}{% if p.stats.firmware %}<span>Firmware <strong>{{ p.stats.firmware }}</strong></span>{% endif %}</p>
@@ -376,7 +376,7 @@
         <div class="check-grid">
           <div><b>01</b><strong>Advertise the printer</strong><p>An always-on device on the printer LAN should advertise that address, preferably as a /32.</p></div>
           <div><b>02</b><strong>Approve the route</strong><p>Approve it for this printer's device in the Tailscale admin console.</p></div>
-          <div><b>03</b><strong>Use the LAN address</strong><p>Add the printer with that LAN address. Print and IPP traffic use this device. SNMP supply readings stay on the local network.</p></div>
+          <div><b>03</b><strong>Use the LAN address</strong><p>Add the printer with that LAN address. Print jobs and toner, drum, paper, and jam readings use this printer's device.</p></div>
         </div>
       </section>
     {% elif page=='jobs' %}

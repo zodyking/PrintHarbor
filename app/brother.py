@@ -183,17 +183,32 @@ def _request(oids, community):
     return _tlv(0x30, _integer(0) + _tlv(0x04, community.encode('ascii')) + pdu)
 
 
+def _snmp_payload(host, port, packet, timeout):
+    """Bytes from the printer. A device path that fails does not fall back to the LAN."""
+    from . import tailnet
+    try:
+        proxied = tailnet.udp_exchange(host, port, packet, max(float(timeout), 3))
+    except (OSError, tailnet.TailscaleError):
+        return None
+    if proxied is not None:
+        return proxied or None
+    try:
+        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
+            sock.settimeout(timeout)
+            sock.sendto(packet, (host, port))
+            payload, _address = sock.recvfrom(65535)
+        return payload
+    except OSError:
+        return None
+
+
 def snmp_get(host, oids, community='public', port=161, timeout=1.2):
     """One SNMPv1 GET. None when the printer does not answer."""
     if not oids:
         return {}
     packet = _request(oids, community)
-    try:
-        with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as sock:
-            sock.settimeout(timeout)
-            sock.sendto(packet, (host, port))
-            payload, _ = sock.recvfrom(65535)
-    except OSError:
+    payload = _snmp_payload(host, port, packet, timeout)
+    if not payload:
         return None
     try:
         _, status, index, values = decode_message(payload)

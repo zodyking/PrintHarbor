@@ -264,9 +264,10 @@ def ipp_attributes(host):
         for payload in (http, body):
             if gave_up:
                 break
+            wait = 6 if tailnet.proxy_for(host) else 2
             try:
-                with open_connection(host, 631, 2) as sock:
-                    sock.settimeout(2)
+                with open_connection(host, 631, wait) as sock:
+                    sock.settimeout(wait)
                     sock.sendall(payload)
                     parsed = parse_ipp(_read_socket(sock))
             except TimeoutError:
@@ -1489,7 +1490,27 @@ def _snmp_int(raw):
         return int(text)
     return None
 
+def _snmp_over_device(host):
+    """Standard printer readings through the printer's own Tailscale device."""
+    community = os.getenv('SNMP_COMMUNITY', 'public') or 'public'
+    try:
+        port = int(os.getenv('SNMP_PORT', '161'))
+    except ValueError:
+        port = 161
+    values = brother.snmp_get(host, list(SNMP_OIDS), community, port, timeout=3)
+    if not values:
+        return None
+    lines = []
+    for oid in SNMP_OIDS:
+        raw = values.get(oid, '')
+        if isinstance(raw, bytes):
+            raw = raw.decode('utf-8', 'replace')
+        lines.append(str(raw).strip())
+    return lines
+
 def _snmp_lines(host):
+    if tailnet.proxy_for(host):
+        return _snmp_over_device(host)
     community = os.getenv('SNMP_COMMUNITY', 'public')
     if not community or not shutil.which('snmpget'):
         return None

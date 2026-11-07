@@ -154,6 +154,7 @@ def render_page(request, page='overview', notice='', error='', config=None, fold
         'mail': mailer.snapshot(),
         'events': store.records('events', 12) if page == 'overview' else [],
         'tail': tail,
+        'tail_note': tailnet.notice(printers, tail),
         'tail_dismissed': bool(request.session.get('tail_dismissed')),
         'active_jobs': printing.active_jobs() if page == 'jobs' else EMPTY_CUPS,
         'cups_report': printing.cups_printers() if page == 'printers' else EMPTY_CUPS,

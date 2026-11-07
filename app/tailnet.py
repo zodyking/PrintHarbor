@@ -305,13 +305,117 @@ def bind_host(queue, host):
             _HOSTS[host] = queue
 
 
+def proxy_for(host):
+    """SOCKS port for the printer that owns this address, or 0 when it has no device."""
+    queue = _queue_for_host(host)
+    if not queue:
+        return 0
+    return _socks_port(queue)
+
+
 def open_tcp(host, port, timeout):
     """Dial a printer through its own device when that device is running."""
-    queue = _queue_for_host(host)
-    proxy = _socks_port(queue) if queue else 0
+    proxy = proxy_for(host)
     if proxy:
         return socks_connect(proxy, host, port, timeout)
     return socket.create_connection((host, port), timeout=timeout)
+
+
+def _socks_bind(sock, atyp):
+    if atyp == 1:
+        raw = _exact(sock, 6)
+        return socket.inet_ntoa(raw[:4]), int.from_bytes(raw[4:6], 'big')
+    if atyp == 4:
+        raw = _exact(sock, 18)
+        return socket.inet_ntop(socket.AF_INET6, raw[:16]), int.from_bytes(raw[16:18], 'big')
+    if atyp == 3:
+        length = _exact(sock, 1)[0]
+        raw = _exact(sock, length + 2)
+        return raw[:length].decode('idna', 'replace'), int.from_bytes(raw[length:], 'big')
+    raise TailscaleError('The tailnet proxy sent an unexpected reply')
+
+
+def _udp_packet(host, port, payload):
+    try:
+        address = socket.inet_aton(str(host))
+        head = b'\x00\x00\x00\x01' + address
+    except OSError:
+        name = str(host).encode('idna')
+        if not name or len(name) > 255:
+            raise TailscaleError('That address is too long')
+        head = b'\x00\x00\x00\x03' + bytes([len(name)]) + name
+    return head + int(port).to_bytes(2, 'big') + payload
+
+
+def _udp_body(packet):
+    if len(packet) < 4 or packet[2] != 0:
+        return b''
+    kind = packet[3]
+    if kind == 1 and len(packet) >= 10:
+        return packet[10:]
+    if kind == 4 and len(packet) >= 22:
+        return packet[22:]
+    if kind == 3 and len(packet) >= 7:
+        length = packet[4]
+        start = 7 + length
+        if len(packet) >= start:
+            return packet[start:]
+    return b''
+
+
+def udp_exchange(host, port, payload, timeout=3):
+    """One UDP datagram through this printer's device. None when the printer has no device."""
+    proxy = proxy_for(host)
+    if not proxy:
+        return None
+    tcp = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    tcp.settimeout(timeout)
+    udp = None
+    try:
+        tcp.connect(('127.0.0.1', int(proxy)))
+        tcp.sendall(b'\x05\x01\x00')
+        if _exact(tcp, 2) != b'\x05\x00':
+            raise TailscaleError('The tailnet proxy refused the connection')
+        tcp.sendall(b'\x05\x03\x00\x01\x00\x00\x00\x00\x00\x00')
+        head = _exact(tcp, 4)
+        if head[0] != 5 or head[1] != 0:
+            raise TailscaleError('The tailnet proxy does not forward UDP')
+        bind_host, bind_port = _socks_bind(tcp, head[3])
+        if bind_host in ('0.0.0.0', '::', '::0'):
+            bind_host = '127.0.0.1'
+        family = socket.AF_INET6 if ':' in bind_host else socket.AF_INET
+        udp = socket.socket(family, socket.SOCK_DGRAM)
+        udp.settimeout(timeout)
+        udp.sendto(_udp_packet(host, port, payload), (bind_host, bind_port))
+        packet, _address = udp.recvfrom(65535)
+        return _udp_body(packet)
+    finally:
+        if udp is not None:
+            udp.close()
+        tcp.close()
+
+
+def notice(printers, status):
+    """Sidebar line for Tailscale. A missing device names that printer."""
+    if status.get('online'):
+        return {
+            'kind': 'online',
+            'title': status.get('hostname') or 'Tailscale',
+            'detail': status.get('ip') or status.get('state') or 'Connected',
+        }
+    missing = []
+    for printer in printers or []:
+        item = printer.get('tail') or {}
+        if item.get('online') or item.get('hostname'):
+            continue
+        missing.append(printer.get('label') or 'A printer')
+    if not missing:
+        return None
+    if len(missing) == 1:
+        detail = 'This printer has no Tailscale device'
+    else:
+        detail = f'{len(missing)} printers have no Tailscale device'
+    return {'kind': 'unset', 'title': f'{missing[0]} is not set up', 'detail': detail}
 
 
 def _bridge(left, right):
