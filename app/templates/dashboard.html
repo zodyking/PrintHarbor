@@ -9,6 +9,19 @@
 <div class="level-track" role="meter" aria-valuenow="{{ supply.percent }}" aria-valuemin="0" aria-valuemax="100" aria-label="{{ label }}"><span class="level-fill {{ band }}" style="width: {{ supply.percent }}%"></span></div>
 {% endif %}
 {% endmacro %}
+{% macro sensor_icon(name) %}
+{% set key = (name or '')|lower %}
+<svg class="sensor-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">{% if 'toner' in key or 'ink' in key or 'cartridge' in key %}<path d="M8 3h8v4l2 2v12H6V9l2-2z"/><path d="M9 13h6"/>{% elif 'drum' in key %}<ellipse cx="12" cy="7" rx="7" ry="3"/><path d="M5 7v10c0 1.7 3.1 3 7 3s7-1.3 7-3V7"/>{% elif 'jam' in key %}<path d="M12 9v4"/><path d="M12 17h.01"/><path d="M10.3 4.5 2.8 18a2 2 0 0 0 1.7 3h15a2 2 0 0 0 1.7-3L13.7 4.5a2 2 0 0 0-3.4 0z"/>{% elif 'paper' in key %}<path d="M7 3h7l5 5v13H7z"/><path d="M14 3v5h5"/>{% elif 'door' in key or 'cover' in key %}<path d="M6 21V5a2 2 0 0 1 2-2h8v18"/><circle cx="13.5" cy="12" r=".8" fill="currentColor" stroke="none"/>{% elif 'health' in key %}<path d="M3 12h4l2-5 4 10 2-5h6"/>{% elif 'status' in key %}<circle cx="12" cy="12" r="8"/><path d="M12 8v4l3 2"/>{% else %}<rect x="4" y="4" width="16" height="16" rx="3"/><path d="M8 12h8"/>{% endif %}</svg>
+{% endmacro %}
+{% macro sensor(label, value, tone='', meter_supply=none, link=none, note='') %}
+<div class="sensor{% if tone %} is-{{ tone }}{% endif %}">
+  {{ sensor_icon(label) }}
+  <div class="sensor-copy">
+    <dt>{% if link %}<a class="supply-label" href="{{ link }}" target="_blank" rel="noopener noreferrer" title="Lowest price on Amazon">{{ label }}</a>{% else %}{{ label }}{% endif %}</dt>
+    <dd><strong>{{ value }}</strong>{% if meter_supply %}{{ meter(meter_supply, label ~ ' level') }}{% endif %}{% if note %}<small>{{ note }}</small>{% endif %}</dd>
+  </div>
+</div>
+{% endmacro %}
 {% macro printer_station(p) %}
 {% set c = p.condition %}
 {% set toner = c.toner if c else none %}
@@ -17,45 +30,19 @@
 {% set jam = c.jam if c else 'unknown' %}
 {% set paper_word = {'ready':'In the tray','low':'Paper low','empty':'Out of paper','unknown':'Not reported'} %}
 {% set jam_word = {'clear':'Clear','jam':'Paper jam','unknown':'Not reported'} %}
+{% set toner_label = toner.name if toner else (c.mark if c else 'Toner') %}
 <div class="station">
   <div class="station-visual">
     <img class="printer-photo" src="/printer-images/{{ p.queue }}" alt="{{ p.label }}" width="260" height="180" {% if p.image.pending %}data-pending="1"{% endif %}>
   </div>
-  <dl class="readout">
-    <div class="read">
-      {% set toner_label = toner.name if toner else (c.mark if c else 'Toner') %}
-      <dt>{% if p.supply %}<a class="supply-label" href="{{ p.supply.url }}" target="_blank" rel="noopener noreferrer" title="Lowest price on Amazon">{{ toner_label }}</a>{% else %}{{ toner_label }}{% endif %}</dt>
-      <dd>
-        {% if toner %}
-        <strong>{{ toner.percent }}%</strong>
-        {{ meter(toner, toner.name ~ ' level') }}
-        {% if c.note %}<small>{{ c.note }}</small>{% endif %}
-        {% else %}<strong class="quiet-value">Not reported</strong>{% endif %}
-      </dd>
-    </div>
-    <div class="read">
-      <dt>{{ drum.name if drum else 'Drum' }}</dt>
-      <dd>
-        {% if drum %}
-        <strong>{{ drum.percent }}%</strong>
-        {{ meter(drum, drum.name ~ ' life') }}
-        {% else %}<strong class="quiet-value">Not reported</strong>{% endif %}
-      </dd>
-    </div>
-    <div class="read{% if paper == 'empty' %} is-bad{% elif paper == 'low' %} is-warn{% endif %}">
-      <dt>Paper</dt>
-      <dd><strong>{{ paper_word.get(paper, 'Not reported') }}</strong></dd>
-    </div>
-    <div class="read{% if jam == 'jam' %} is-bad{% endif %}">
-      <dt>Jam</dt>
-      <dd><strong>{{ jam_word.get(jam, 'Not reported') }}</strong></dd>
-    </div>
+  <dl class="sensor-grid">
+    {{ sensor(toner_label, (toner.percent ~ '%') if toner else 'Not reported', 'low' if toner and toner.percent <= 15 else ('mid' if toner and toner.percent <= 30 else ''), toner, p.supply.url if p.supply else none, c.note if c and c.note else '') }}
+    {{ sensor(drum.name if drum else 'Drum', (drum.percent ~ '%') if drum else 'Not reported', 'low' if drum and drum.percent <= 15 else ('mid' if drum and drum.percent <= 30 else ''), drum) }}
+    {{ sensor('Paper', paper_word.get(paper, 'Not reported'), 'bad' if paper == 'empty' else ('warn' if paper == 'low' else '')) }}
+    {{ sensor('Jam', jam_word.get(jam, 'Not reported'), 'bad' if jam == 'jam' else '') }}
     {% if p.stats and p.stats.checks %}
     {% for row in p.stats.checks %}
-    <div class="read{% if row.bad %} is-bad{% endif %}">
-      <dt>{{ row.label }}</dt>
-      <dd><strong>{{ row.value }}</strong></dd>
-    </div>
+    {{ sensor(row.label, row.value, 'bad' if row.bad else '') }}
     {% endfor %}
     {% endif %}
   </dl>
@@ -97,7 +84,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>PrintHarbor · {{ labels[page] }}</title>
   <link rel="icon" href="/static/favicon.svg" type="image/svg+xml">
-  <link rel="stylesheet" href="/static/style.css?v=23">
+  <link rel="stylesheet" href="/static/style.css?v=24">
 </head>
 <body>
 <a class="skip" href="#content">Skip to content</a>
